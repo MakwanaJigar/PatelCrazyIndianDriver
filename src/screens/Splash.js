@@ -12,6 +12,8 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { createScaler } from '../utils/responsive';
 import { ROUTES } from '../navigation/routes';
+import { getSession } from '../api/session';
+import { getLaunchNotification } from '../notifications/push';
 
 const { width, height } = Dimensions.get('window');
 
@@ -158,9 +160,25 @@ const DriverSplashScreen = ({ navigation }) => {
       floatLoop.start();
     }, 1800);
 
-    // AUTO NAVIGATION -> bottom tabs (replace so "back" can't return to splash)
-    const navigationTimer = setTimeout(() => {
-      navigation.replace(ROUTES.MAIN_TABS);
+    // AUTO NAVIGATION (replace so "back" can't return to splash):
+    // saved session -> bottom tabs, otherwise -> login.
+    // If the app was opened by tapping a push notification, open
+    // Notifications on top of the tabs.
+    const sessionPromise = getSession();
+    const launchPromise = getLaunchNotification();
+    const navigationTimer = setTimeout(async () => {
+      const session = await sessionPromise;
+      const launchNotification = await launchPromise;
+
+      if (session && launchNotification) {
+        navigation.reset({
+          index: 1,
+          routes: [{ name: ROUTES.MAIN_TABS }, { name: ROUTES.NOTIFICATIONS }],
+        });
+        return;
+      }
+
+      navigation.replace(session ? ROUTES.MAIN_TABS : ROUTES.LOGIN);
     }, 4500);
 
     return () => {
@@ -178,57 +196,19 @@ const DriverSplashScreen = ({ navigation }) => {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <StatusBar
-        barStyle="dark-content"
-        backgroundColor="#FAF9FF"
-      />
+      <StatusBar barStyle="dark-content" backgroundColor="#FAF9FF" />
 
       {/* ======================================================
           BACKGROUND
       ====================================================== */}
 
-      <View
-        pointerEvents="none"
-        style={styles.backgroundLayer}
-      >
+      <View pointerEvents="none" style={styles.backgroundLayer}>
         <View style={styles.pinkGlow} />
         <View style={styles.greenGlow} />
         <View style={styles.blueGlow} />
       </View>
 
       <View style={styles.container}>
-        {/* ======================================================
-            TOP STATUS
-        ====================================================== */}
-
-        <Animated.View
-          style={[
-            styles.topRow,
-            {
-              opacity: topOpacity,
-              transform: [{ translateY: topY }],
-            },
-          ]}
-        >
-          <View style={styles.fleetBadge}>
-            <View style={styles.fleetDot} />
-
-            <Text style={styles.fleetText}>
-              FLEET CORE LIVE
-            </Text>
-          </View>
-
-          <View style={styles.dispatchBadge}>
-            <Text style={styles.lightning}>
-              ⚡
-            </Text>
-
-            <Text style={styles.dispatchText}>
-              5G Dispatch
-            </Text>
-          </View>
-        </Animated.View>
-
         {/* ======================================================
             CENTER CONTENT
         ====================================================== */}
@@ -241,10 +221,7 @@ const DriverSplashScreen = ({ navigation }) => {
               styles.logoArea,
               {
                 opacity: logoOpacity,
-                transform: [
-                  { scale: logoScale },
-                  { translateY: floatingLogo },
-                ],
+                transform: [{ scale: logoScale }, { translateY: floatingLogo }],
               },
             ]}
           >
@@ -255,142 +232,6 @@ const DriverSplashScreen = ({ navigation }) => {
                 resizeMode="contain"
               />
             </View>
-
-            <View style={styles.partnerBadge}>
-              <Text style={styles.partnerBadgeText}>
-                🚚 PARTNER FLEET
-              </Text>
-            </View>
-          </Animated.View>
-
-          {/* TITLE */}
-
-          <Animated.View
-            style={[
-              styles.titleArea,
-              {
-                opacity: titleOpacity,
-                transform: [{ translateY: titleY }],
-              },
-            ]}
-          >
-            <Text style={styles.mainTitle}>
-              Patel’s Crazy Indian
-            </Text>
-
-            <Text style={styles.subTitle}>
-              DRIVER PARTNER APP • THE FESTIVE TREAT
-            </Text>
-
-            <Text style={styles.subTitle}>
-              EXPRESS
-            </Text>
-          </Animated.View>
-
-          {/* TAGLINE */}
-
-          <Animated.View
-            style={[
-              styles.taglinePill,
-              {
-                opacity: tagOpacity,
-                transform: [{ translateY: tagY }],
-              },
-            ]}
-          >
-            <Text style={styles.taglineText}>
-              Delivering Royal Flavors with Lightning Speed
-            </Text>
-          </Animated.View>
-
-          {/* STATUS CARD */}
-
-          <Animated.View
-            style={[
-              styles.statusCard,
-              {
-                opacity: statusOpacity,
-                transform: [{ translateY: statusY }],
-              },
-            ]}
-          >
-            <View style={styles.statusTop}>
-              <View style={styles.readyRow}>
-                <Text style={styles.readyIcon}>
-                  ↻
-                </Text>
-
-                <Text style={styles.readyText}>
-                  Ready for Takeoff! Online.
-                </Text>
-              </View>
-
-              <Text style={styles.statusPercent}>
-                100%
-              </Text>
-            </View>
-
-            {/* PROGRESS */}
-
-            <View style={styles.progressTrack}>
-              <Animated.View
-                style={[
-                  styles.progressFill,
-                  {
-                    width: progressBarWidth,
-                  },
-                ]}
-              />
-            </View>
-
-            {/* BOTTOM STATUS */}
-
-            <View style={styles.statusBottom}>
-              <View style={styles.statusBottomItem}>
-                <Text style={styles.signalIcon}>
-                  ◉
-                </Text>
-
-                <Text style={styles.statusBottomText}>
-                  Low Latency Ping: 18ms
-                </Text>
-              </View>
-
-              <View style={styles.statusBottomItem}>
-                <Text style={styles.securityIcon}>
-                  ⎈
-                </Text>
-
-                <Text style={styles.secureText}>
-                  Secure TLS
-                </Text>
-              </View>
-            </View>
-          </Animated.View>
-
-          {/* FOOTER */}
-
-          <Animated.View
-            style={[
-              styles.footerArea,
-              {
-                opacity: footerOpacity,
-              },
-            ]}
-          >
-            <View style={styles.versionBadge}>
-              <Text style={styles.versionDot}>
-                ●
-              </Text>
-
-              <Text style={styles.versionText}>
-                v4.12.0 • Bangalore Hub
-              </Text>
-            </View>
-
-            <Text style={styles.footerText}>
-              ★ Fastest Restaurant Delivery Fleet ★
-            </Text>
           </Animated.View>
         </View>
       </View>
@@ -557,8 +398,7 @@ const styles = StyleSheet.create({
     flex: 1,
 
     alignItems: 'center',
-
-    paddingTop: rs(40),
+    justifyContent: 'center',
   },
 
   // ==========================================================
@@ -570,11 +410,11 @@ const styles = StyleSheet.create({
   },
 
   logoCard: {
-    width: rs(280),
-    height: rs(280),
+    width: rs(330),
+    height: rs(330),
 
-    maxWidth: width * 0.62,
-    maxHeight: width * 0.62,
+    maxWidth: width * 0.72,
+    maxHeight: width * 0.72,
 
     backgroundColor: '#FFFFFF',
 

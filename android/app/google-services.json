@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1079653295400",
+    "project_id": "indiancrazydriver-98be5",
+    "storage_bucket": "indiancrazydriver-98be5.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1079653295400:android:5cc397b110975c44fb9c1d",
+        "android_client_info": {
+          "package_name": "com.crazyindiandriver"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDyAIejdLs1gjq6s7_E3EZyH792KNdf1Xs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

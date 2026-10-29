@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -8,30 +8,168 @@ import {
   StatusBar,
   Animated,
   Easing,
-  Dimensions,
-  Image,
-  Switch,
+  ActivityIndicator,
+  RefreshControl,
 } from 'react-native';
+import { showAlert } from '../components/AppAlert';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useFocusEffect } from '@react-navigation/native';
 import { createScaler } from '../utils/responsive';
 import { ROUTES } from '../navigation/routes';
+import AppHeader from '../components/AppHeader';
+import { getSession, clearSession } from '../api/session';
+import { apiPost } from '../api/client';
+import { fetchProfile } from '../api/profile';
 
-const { width } = Dimensions.get('window');
+// ============================================================
+// PROFILE
+// ------------------------------------------------------------
+// Shows the logged-in driver's details (same fields as the
+// register payload). The saved session is shown instantly, then
+// GET /driver/profile refreshes it whenever this tab comes into
+// focus (e.g. back from Edit Profile) or on pull-to-refresh.
+// ============================================================
 
-const DESIGN_WIDTH = 306;
+const DESIGN_WIDTH = 412;
 const { rs, fs } = createScaler(DESIGN_WIDTH);
 
 const RED = '#EC2027';
 const GREEN = '#079A68';
 const DARK = '#111827';
 const MUTED = '#64748B';
-const BORDER = '#DEE5ED';
 const BG = '#F7F9FC';
-const LIGHT_GREEN = '#E9FBF3';
+
+const MONTHS = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+const show = value => (value == null || value === '' ? '—' : String(value));
+
+// "2028-11-30" -> "30 Nov 2028"
+const formatDate = value => {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(value || '');
+  if (!match) {
+    return show(value);
+  }
+  const [, y, m, d] = match;
+  return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
+};
+
+const isExpired = value => {
+  const date = new Date(value);
+  return !isNaN(date.getTime()) && date <= new Date();
+};
+
+const getInitials = driver =>
+  [driver.first_name, driver.last_name]
+    .filter(Boolean)
+    .map(part => String(part)[0])
+    .join('')
+    .toUpperCase() || '?';
 
 const ProfileScreen = ({ navigation }) => {
-  const [nightMode, setNightMode] = useState(true);
-  const [language, setLanguage] = useState('English');
+  const [driver, setDriver] = useState({});
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // Profile lives inside the bottom tabs; reset the ROOT stack so
+  // "back" can't return to the logged-in screens.
+  const goToLogin = useCallback(() => {
+    (navigation.getParent() ?? navigation).reset({
+      index: 0,
+      routes: [{ name: ROUTES.LOGIN }],
+    });
+  }, [navigation]);
+
+  // GET /driver/profile. A 401 means the token is no longer valid,
+  // so the driver is sent back to Login.
+  const loadProfile = useCallback(
+    async (isActive = () => true) => {
+      try {
+        const latest = await fetchProfile();
+        if (isActive()) {
+          setDriver(latest || {});
+        }
+      } catch (e) {
+        if (e.status === 401) {
+          await clearSession().catch(() => {});
+          if (isActive()) {
+            showAlert('Session expired', 'Please log in again.', [], {
+              type: 'warning',
+            });
+            goToLogin();
+          }
+        } else {
+          console.warn('Profile API failed:', e.message);
+        }
+      }
+    },
+    [goToLogin],
+  );
+
+  // Show the cached profile instantly, then refresh from the server
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      getSession().then(session => {
+        if (active) {
+          setDriver(session?.driver || {});
+        }
+      });
+      loadProfile(() => active);
+      return () => {
+        active = false;
+      };
+    }, [loadProfile]),
+  );
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await loadProfile();
+    setRefreshing(false);
+  };
+
+  // POST /driver/logout (Bearer token). The local session is cleared
+  // even if the request fails, so the driver is never stuck logged in.
+  const logout = async () => {
+    setLoggingOut(true);
+
+    try {
+      const session = await getSession();
+      await apiPost('/driver/logout', {}, { token: session?.token });
+    } catch (e) {
+      console.warn('Logout API failed:', e.message);
+    }
+
+    try {
+      await clearSession();
+    } catch (e) {
+      console.warn('Could not clear session:', e);
+    }
+
+    setLoggingOut(false);
+    goToLogin();
+  };
+
+  const handleLogout = () => {
+    showAlert('Log Out', 'Are you sure you want to log out?', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Log Out', style: 'destructive', onPress: logout },
+    ]);
+  };
+
+  const openEdit = () => navigation.navigate(ROUTES.EDIT_PROFILE);
 
   // ============================================================
   // ANIMATIONS
@@ -43,25 +181,10 @@ const ProfileScreen = ({ navigation }) => {
   const profileOpacity = useRef(new Animated.Value(0)).current;
   const profileScale = useRef(new Animated.Value(0.94)).current;
 
-  const walletOpacity = useRef(new Animated.Value(0)).current;
-  const walletY = useRef(new Animated.Value(25)).current;
-
-  const honorOpacity = useRef(new Animated.Value(0)).current;
-  const honorY = useRef(new Animated.Value(25)).current;
-
-  const documentOpacity = useRef(new Animated.Value(0)).current;
-  const documentY = useRef(new Animated.Value(25)).current;
-
-  const gearOpacity = useRef(new Animated.Value(0)).current;
-  const gearY = useRef(new Animated.Value(25)).current;
-
-  const preferenceOpacity = useRef(new Animated.Value(0)).current;
-  const preferenceY = useRef(new Animated.Value(25)).current;
+  const sectionsOpacity = useRef(new Animated.Value(0)).current;
+  const sectionsY = useRef(new Animated.Value(25)).current;
 
   const footerOpacity = useRef(new Animated.Value(0)).current;
-
-  const dutyPulse = useRef(new Animated.Value(1)).current;
-  const withdrawScale = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
     Animated.sequence([
@@ -71,7 +194,6 @@ const ProfileScreen = ({ navigation }) => {
           duration: 350,
           useNativeDriver: true,
         }),
-
         Animated.timing(headerY, {
           toValue: 0,
           duration: 400,
@@ -86,7 +208,6 @@ const ProfileScreen = ({ navigation }) => {
           duration: 350,
           useNativeDriver: true,
         }),
-
         Animated.spring(profileScale, {
           toValue: 1,
           friction: 7,
@@ -95,194 +216,57 @@ const ProfileScreen = ({ navigation }) => {
         }),
       ]),
 
-      Animated.stagger(80, [
-        Animated.parallel([
-          Animated.timing(walletOpacity, {
-            toValue: 1,
-            duration: 350,
-            useNativeDriver: true,
-          }),
-
-          Animated.timing(walletY, {
-            toValue: 0,
-            duration: 400,
-            easing: Easing.out(Easing.cubic),
-            useNativeDriver: true,
-          }),
-        ]),
-
-        Animated.parallel([
-          Animated.timing(honorOpacity, {
-            toValue: 1,
-            duration: 350,
-            useNativeDriver: true,
-          }),
-
-          Animated.timing(honorY, {
-            toValue: 0,
-            duration: 400,
-            useNativeDriver: true,
-          }),
-        ]),
-
-        Animated.parallel([
-          Animated.timing(documentOpacity, {
-            toValue: 1,
-            duration: 350,
-            useNativeDriver: true,
-          }),
-
-          Animated.timing(documentY, {
-            toValue: 0,
-            duration: 400,
-            useNativeDriver: true,
-          }),
-        ]),
-
-        Animated.parallel([
-          Animated.timing(gearOpacity, {
-            toValue: 1,
-            duration: 350,
-            useNativeDriver: true,
-          }),
-
-          Animated.timing(gearY, {
-            toValue: 0,
-            duration: 400,
-            useNativeDriver: true,
-          }),
-        ]),
-
-        Animated.parallel([
-          Animated.timing(preferenceOpacity, {
-            toValue: 1,
-            duration: 350,
-            useNativeDriver: true,
-          }),
-
-          Animated.timing(preferenceY, {
-            toValue: 0,
-            duration: 400,
-            useNativeDriver: true,
-          }),
-        ]),
+      Animated.parallel([
+        Animated.timing(sectionsOpacity, {
+          toValue: 1,
+          duration: 350,
+          useNativeDriver: true,
+        }),
+        Animated.timing(sectionsY, {
+          toValue: 0,
+          duration: 400,
+          easing: Easing.out(Easing.cubic),
+          useNativeDriver: true,
+        }),
       ]),
 
       Animated.timing(footerOpacity, {
         toValue: 1,
-        duration: 350,
+        duration: 300,
         useNativeDriver: true,
       }),
     ]).start();
-
-    const dutyLoop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(dutyPulse, {
-          toValue: 1.05,
-          duration: 1100,
-          easing: Easing.inOut(Easing.ease),
-          useNativeDriver: true,
-        }),
-
-        Animated.timing(dutyPulse, {
-          toValue: 1,
-          duration: 1100,
-          easing: Easing.inOut(Easing.ease),
-          useNativeDriver: true,
-        }),
-      ]),
-    );
-
-    const timer = setTimeout(() => {
-      dutyLoop.start();
-    }, 1300);
-
-    return () => {
-      clearTimeout(timer);
-      dutyLoop.stop();
-    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const pressWithdraw = () => {
-    Animated.sequence([
-      Animated.timing(withdrawScale, {
-        toValue: 0.97,
-        duration: 100,
-        useNativeDriver: true,
-      }),
+  const fullName =
+    [driver.first_name, driver.last_name].filter(Boolean).join(' ') || 'Driver';
 
-      Animated.spring(withdrawScale, {
-        toValue: 1,
-        friction: 4,
-        tension: 100,
-        useNativeDriver: true,
-      }),
-    ]).start();
+  const address = [
+    driver.street_line_1,
+    driver.street_line_2,
+    [driver.suburb, driver.postcode].filter(Boolean).join(' '),
+  ]
+    .filter(Boolean)
+    .join(', ');
 
-    console.log('Withdraw Now');
-  };
+  const licenceExpired = isExpired(driver.license_expiry_date);
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <StatusBar
-        barStyle="dark-content"
-        backgroundColor="#FFFFFF"
-      />
+      <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
 
       <View style={styles.screen}>
         {/* ====================================================
             HEADER
         ==================================================== */}
 
-        <Animated.View
-          style={[
-            styles.header,
-            {
-              opacity: headerOpacity,
-              transform: [{ translateY: headerY }],
-            },
-          ]}
-        >
-          <View style={styles.brandArea}>
-            <Image
-              source={require('../assets/logo.png')}
-              style={styles.brandLogo}
-              resizeMode="contain"
-            />
-
-            <View>
-              <Text style={styles.brandTitle}>
-                Patel’s Driver
-              </Text>
-
-              <Text style={styles.brandSubtitle}>
-                Profile
-              </Text>
-            </View>
-          </View>
-
-          <View style={styles.headerRight}>
-            <Animated.View
-              style={[
-                styles.dutyBadge,
-                {
-                  transform: [{ scale: dutyPulse }],
-                },
-              ]}
-            >
-              <View style={styles.dutyDot} />
-
-              <Text style={styles.dutyText}>
-                ON DUTY
-              </Text>
-            </Animated.View>
-
-            <Image
-              source={require('../assets/logo.png')}
-              style={styles.headerProfile}
-            />
-          </View>
-        </Animated.View>
+        <AppHeader
+          style={{
+            opacity: headerOpacity,
+            transform: [{ translateY: headerY }],
+          }}
+        />
 
         {/* ====================================================
             SCROLL
@@ -291,510 +275,169 @@ const ProfileScreen = ({ navigation }) => {
         <ScrollView
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.scrollContent}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              colors={[RED]}
+              tintColor={RED}
+            />
+          }
         >
           {/* ====================================================
-              DRIVER PROFILE
+              PROFILE HERO
           ==================================================== */}
 
           <Animated.View
             style={[
-              styles.profileCard,
+              styles.heroCard,
               {
                 opacity: profileOpacity,
                 transform: [{ scale: profileScale }],
               },
             ]}
           >
-            <View style={styles.profileTop}>
-              <View style={styles.profilePhotoWrapper}>
-                <Image
-                  source={require('../assets/logo.png')}
-                  style={styles.profilePhoto}
-                />
+            <View style={styles.heroCircleLarge} />
+            <View style={styles.heroCircleSmall} />
 
-                <View style={styles.verifiedMiniBadge}>
-                  <Text style={styles.verifiedMiniText}>
-                    ✓
-                  </Text>
-                </View>
+            <View style={styles.avatar}>
+              <Text style={styles.avatarText}>{getInitials(driver)}</Text>
+            </View>
+
+            <Text numberOfLines={1} style={styles.heroName}>
+              {fullName}
+            </Text>
+
+            <Text numberOfLines={1} style={styles.heroEmail}>
+              {show(driver.email)}
+            </Text>
+
+            <View style={styles.heroChips}>
+              <View style={styles.heroChip}>
+                <Text style={styles.heroChipText}>
+                  🚗 {show(driver.vehicle_rego_number)}
+                </Text>
               </View>
 
-              <View style={styles.profileInfo}>
-                <Text style={styles.name}>
-                  Rahul Verma
-                </Text>
-
-                <Text style={styles.captainId}>
-                  #PCI-DRV-4091
-                </Text>
-
-                <View style={styles.ratingRow}>
-                  <View style={styles.ratingBadge}>
-                    <Text style={styles.ratingStar}>☆</Text>
-                    <Text style={styles.ratingValue}>4.92</Text>
-                  </View>
-
-                  <Text style={styles.deliveryCount}>
-                    • 1,240 deliveries
-                  </Text>
-                </View>
-              </View>
-
-              <View style={styles.activeBadge}>
-                <Text style={styles.activeText}>
-                  ACTIVE
-                </Text>
+              <View style={styles.heroChip}>
+                <View style={styles.activeDot} />
+                <Text style={styles.heroChipText}>Active Driver</Text>
               </View>
             </View>
 
-            <View style={styles.vehicleCard}>
-              <View style={styles.vehicleIconBox}>
-                <Text style={styles.vehicleIcon}>
-                  🛵
-                </Text>
-              </View>
-
-              <View style={styles.vehicleInfo}>
-                <Text style={styles.vehicleName}>
-                  Honda Activa 6G
-                </Text>
-
-                <Text style={styles.vehicleNumber}>
-                  KA-03-EX-9921
-                </Text>
-              </View>
-
-              <View style={styles.vehicleVerified}>
-                <Text style={styles.vehicleVerifiedText}>
-                  ◯ Verified
-                </Text>
-              </View>
-            </View>
-          </Animated.View>
-
-          {/* ====================================================
-              WALLET
-          ==================================================== */}
-
-          <Animated.View
-            style={[
-              styles.sectionCard,
-              {
-                opacity: walletOpacity,
-                transform: [{ translateY: walletY }],
-              },
-            ]}
-          >
-            <View style={styles.sectionTopRow}>
-              <View style={styles.sectionTitleRow}>
-                <View style={styles.walletIcon}>
-                  <Text style={styles.walletIconText}>
-                    ▣
-                  </Text>
-                </View>
-
-                <Text style={styles.sectionSmallTitle}>
-                  EARNINGS & WALLET
-                </Text>
-              </View>
-
-              <View style={styles.instantBadge}>
-                <Text style={styles.instantText}>
-                  Instant Ready
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.walletHeader}>
-              <View>
-                <Text style={styles.balanceLabel}>
-                  Withdrawable Balance
-                </Text>
-
-                <Text style={styles.balanceAmount}>
-                  ₹3,420.00
-                </Text>
-              </View>
-
-              <View style={styles.tipBadge}>
-                <Text style={styles.tipText}>
-                  ↗ +₹420 Tips
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.bankCard}>
-              <View style={styles.bankIconBox}>
-                <Text style={styles.bankIcon}>
-                  ♜
-                </Text>
-              </View>
-
-              <View style={styles.bankInfo}>
-                <Text style={styles.bankTitle}>
-                  HDFC Bank •••• 4892
-                </Text>
-
-                <Text style={styles.bankSubtitle}>
-                  Primary UPI Payout
-                </Text>
-              </View>
-
-              <Text style={styles.bankVerified}>
-                ✓
-              </Text>
-            </View>
-
-            <Animated.View
-              style={{
-                transform: [{ scale: withdrawScale }],
-              }}
+            <TouchableOpacity
+              activeOpacity={0.85}
+              style={styles.editButton}
+              onPress={openEdit}
             >
-              <TouchableOpacity
-                activeOpacity={0.85}
-                style={styles.withdrawButton}
-                onPress={pressWithdraw}
-              >
-                <Text style={styles.withdrawIcon}>
-                  ▣
-                </Text>
-
-                <Text style={styles.withdrawText}>
-                  Withdraw Now
-                </Text>
-              </TouchableOpacity>
-            </Animated.View>
+              <Text style={styles.editButtonText}>✎ Edit Profile</Text>
+            </TouchableOpacity>
           </Animated.View>
-
-          {/* ====================================================
-              HONOR ROLL
-          ==================================================== */}
 
           <Animated.View
             style={{
-              opacity: honorOpacity,
-              transform: [{ translateY: honorY }],
+              opacity: sectionsOpacity,
+              transform: [{ translateY: sectionsY }],
             }}
           >
-            <View style={styles.honorTitleRow}>
-              <Text style={styles.honorTitle}>
-                Patel’s Honor Roll
-              </Text>
+            {/* ==================================================
+                PERSONAL DETAILS
+            ================================================== */}
 
-              <View style={styles.tierBadge}>
-                <Text style={styles.tierText}>
-                  Tier Level 4
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.honorRow}>
-              <HonorCard
-                icon="ϟ"
-                iconBackground="#FFE5E5"
-                title="Fast"
-                title2="Master"
-                description={'Avg 18m\ndelivery'}
-                red
+            <Section
+              icon="♙"
+              iconBg="#FFE9E9"
+              iconColor={RED}
+              title="Personal Details"
+            >
+              <InfoRow label="First Name" value={show(driver.first_name)} />
+              <InfoRow label="Last Name" value={show(driver.last_name)} />
+              <InfoRow
+                label="Contact Number"
+                value={show(driver.contact_number)}
               />
+              <InfoRow label="Email" value={show(driver.email)} last />
+            </Section>
 
-              <HonorCard
-                icon="♙"
-                iconBackground="#D9FAE9"
-                title="100% Safe"
-                description={'Zero hot\nspills'}
-                green
+            {/* ==================================================
+                ADDRESS
+            ================================================== */}
+
+            <Section
+              icon="⌂"
+              iconBg="#EBF0FF"
+              iconColor="#2F5BD3"
+              title="Address"
+            >
+              <InfoRow
+                label="Street"
+                value={show(
+                  [driver.street_line_1, driver.street_line_2]
+                    .filter(Boolean)
+                    .join(', '),
+                )}
               />
+              <InfoRow label="Suburb" value={show(driver.suburb)} />
+              <InfoRow label="Postcode" value={show(driver.postcode)} />
+              <InfoRow label="Full Address" value={show(address)} last />
+            </Section>
 
-              <HonorCard
-                icon="♛"
-                iconBackground="#FFF2C8"
-                title="Gold Tier"
-                description={'Top 3%\npartner'}
-                yellow
-              />
-            </View>
-          </Animated.View>
+            {/* ==================================================
+                LICENCE & VEHICLE
+            ================================================== */}
 
-          {/* ====================================================
-              DOCUMENTS
-          ==================================================== */}
-
-          <Animated.View
-            style={[
-              styles.sectionCard,
-              {
-                opacity: documentOpacity,
-                transform: [{ translateY: documentY }],
-              },
-            ]}
-          >
-            <View style={styles.sectionTopRow}>
-              <View style={styles.sectionTitleRow}>
-                <View style={styles.greenSectionIcon}>
-                  <Text style={styles.greenSectionIconText}>
-                    ♙
-                  </Text>
-                </View>
-
-                <Text style={styles.sectionTitle}>
-                  Document Verification
-                </Text>
-              </View>
-
-              <View style={styles.allApprovedBadge}>
-                <Text style={styles.allApprovedText}>
-                  All Approved
-                </Text>
-              </View>
-            </View>
-
-            <DocumentRow
-              icon="▤"
-              title="Aadhaar Card"
-              subtitle="•••• •••• 9812"
-            />
-
-            <DocumentRow
+            <Section
               icon="▣"
-              title="Driving License"
-              subtitle="DL-04201900388"
-            />
-
-            <DocumentRow
-              icon="▱"
-              title="Vehicle RC Book"
-              subtitle="Valid until Nov 2028"
-            />
-          </Animated.View>
-
-          {/* ====================================================
-              DELIVERY GEAR
-          ==================================================== */}
-
-          <Animated.View
-            style={[
-              styles.sectionCard,
-              {
-                opacity: gearOpacity,
-                transform: [{ translateY: gearY }],
-              },
-            ]}
-          >
-            <View style={styles.sectionTitleRow}>
-              <View style={styles.yellowSectionIcon}>
-                <Text style={styles.yellowSectionIconText}>
-                  ♨
-                </Text>
-              </View>
-
-              <Text style={styles.sectionTitle}>
-                Delivery Gear & Shifts
-              </Text>
-            </View>
-
-            <View style={styles.settingCard}>
-              <View style={styles.settingIconRed}>
-                <Text style={styles.settingIconText}>
-                  ♜
-                </Text>
-              </View>
-
-              <View style={styles.settingContent}>
-                <Text style={styles.settingTitle}>
-                  Hot Insulation Bag
-                </Text>
-
-                <Text
-                  numberOfLines={1}
-                  style={styles.settingSubtitle}
-                >
-                  Mandatory for Biryani & Curr...
-                </Text>
-              </View>
-
-              <Text style={styles.greenCheck}>
-                ☑
-              </Text>
-            </View>
-
-            <View style={styles.settingCard}>
-              <View style={styles.settingIconBlue}>
-                <Text style={styles.settingIconTextBlue}>
-                  ◔
-                </Text>
-              </View>
-
-              <View style={styles.settingContent}>
-                <Text style={styles.settingTitle}>
-                  Night Shift Mode
-                </Text>
-
-                <Text
-                  numberOfLines={1}
-                  style={styles.settingSubtitle}
-                >
-                  High surge rate (11PM - 4...
-                </Text>
-              </View>
-
-              <Switch
-                value={nightMode}
-                onValueChange={setNightMode}
-                trackColor={{
-                  false: '#CBD5E1',
-                  true: GREEN,
-                }}
-                thumbColor="#FFFFFF"
+              iconBg="#E8FAF1"
+              iconColor={GREEN}
+              title="Licence & Vehicle"
+              badge={
+                driver.license_expiry_date
+                  ? licenceExpired
+                    ? { text: 'Licence Expired', color: RED, bg: '#FFE9E9' }
+                    : { text: 'Licence Valid', color: GREEN, bg: '#E3F9EE' }
+                  : null
+              }
+            >
+              <InfoRow
+                label="Licence Number"
+                value={show(driver.license_number)}
               />
-            </View>
-          </Animated.View>
-
-          {/* ====================================================
-              PREFERENCES
-          ==================================================== */}
-
-          <Animated.View
-            style={[
-              styles.sectionCard,
-              {
-                opacity: preferenceOpacity,
-                transform: [{ translateY: preferenceY }],
-              },
-            ]}
-          >
-            <View style={styles.sectionTitleRow}>
-              <View style={styles.preferenceIcon}>
-                <Text style={styles.preferenceIconText}>
-                  ☷
-                </Text>
-              </View>
-
-              <Text style={styles.sectionTitle}>
-                Preferences & Safety
-              </Text>
-            </View>
-
-            {/* LANGUAGE */}
-
-            <View style={styles.languageCard}>
-              <View style={styles.languageTop}>
-                <View style={styles.languageLabelRow}>
-                  <Text style={styles.globeIcon}>
-                    ◉
-                  </Text>
-
-                  <Text style={styles.languageTitle}>
-                    App Language
-                  </Text>
-                </View>
-
-                <Text style={styles.activeLanguage}>
-                  Active: {language}
-                </Text>
-              </View>
-
-              <View style={styles.languageButtons}>
-                <LanguageButton
-                  title="English"
-                  active={language === 'English'}
-                  onPress={() => setLanguage('English')}
-                />
-
-                <LanguageButton
-                  title="हिन्दी"
-                  active={language === 'हिन्दी'}
-                  onPress={() => setLanguage('हिन्दी')}
-                />
-
-                <LanguageButton
-                  title="ગુજરાતી"
-                  active={language === 'ગુજરાતી'}
-                  onPress={() => setLanguage('ગુજરાતી')}
-                />
-              </View>
-            </View>
-
-            {/* SAFETY */}
-
-            <TouchableOpacity
-              activeOpacity={0.8}
-              style={styles.preferenceRow}
-            >
-              <View style={styles.sosCircle}>
-                <Text style={styles.sosCircleText}>
-                  *
-                </Text>
-              </View>
-
-              <View style={styles.preferenceContent}>
-                <Text style={styles.preferenceTitle}>
-                  Safety Toolkit & SOS
-                </Text>
-
-                <Text style={styles.preferenceSubtitle}>
-                  Patel Hotline & Highway Police
-                </Text>
-              </View>
-
-              <Text style={styles.chevron}>
-                ›
-              </Text>
-            </TouchableOpacity>
-
-            {/* EMERGENCY */}
-
-            <TouchableOpacity
-              activeOpacity={0.8}
-              style={styles.preferenceRow}
-            >
-              <View style={styles.contactCircle}>
-                <Text style={styles.contactCircleText}>
-                  ♙
-                </Text>
-              </View>
-
-              <View style={styles.preferenceContent}>
-                <Text style={styles.preferenceTitle}>
-                  Emergency Contacts
-                </Text>
-
-                <Text style={styles.preferenceSubtitle}>
-                  2 contacts configured
-                </Text>
-              </View>
-
-              <Text style={styles.chevron}>
-                ›
-              </Text>
-            </TouchableOpacity>
+              <InfoRow
+                label="Licence Expiry"
+                value={formatDate(driver.license_expiry_date)}
+                valueColor={licenceExpired ? RED : undefined}
+              />
+              <InfoRow
+                label="Vehicle Rego"
+                value={show(driver.vehicle_rego_number)}
+                last
+              />
+            </Section>
           </Animated.View>
 
           {/* ====================================================
               LOG OUT
           ==================================================== */}
 
-          <Animated.View
-            style={{
-              opacity: footerOpacity,
-            }}
-          >
+          <Animated.View style={{ opacity: footerOpacity }}>
             <TouchableOpacity
               activeOpacity={0.8}
               style={styles.logoutButton}
+              onPress={handleLogout}
+              disabled={loggingOut}
             >
-              <Text style={styles.logoutIcon}>
-                ⇥
-              </Text>
-
-              <Text style={styles.logoutText}>
-                Log Out of Driver Network
-              </Text>
+              {loggingOut ? (
+                <ActivityIndicator color={RED} />
+              ) : (
+                <>
+                  <Text style={styles.logoutIcon}>⇥</Text>
+                  <Text style={styles.logoutText}>Log Out</Text>
+                </>
+              )}
             </TouchableOpacity>
 
-            <Text style={styles.versionText}>
-              Patel’s Delivery OS v4.12.0 • Bangalore Hub
-            </Text>
+            <Text style={styles.versionText}>Patel’s Driver App v1.0</Text>
           </Animated.View>
         </ScrollView>
 
@@ -807,18 +450,6 @@ const ProfileScreen = ({ navigation }) => {
             icon="▦"
             title="Home"
             onPress={() => navigation.navigate(ROUTES.HOME)}
-          />
-
-          <BottomNav
-            icon="♧"
-            title="Orders"
-            onPress={() => navigation.navigate(ROUTES.ORDERS)}
-          />
-
-          <BottomNav
-            icon="◎"
-            title="Live Map"
-            onPress={() => navigation.navigate(ROUTES.LIVE_MAP)}
           />
 
           <BottomNav
@@ -843,145 +474,57 @@ const ProfileScreen = ({ navigation }) => {
    COMPONENTS
 ============================================================ */
 
-const HonorCard = ({
-  icon,
-  iconBackground,
-  title,
-  title2,
-  description,
-  red,
-  green,
-  yellow,
-}) => {
-  return (
-    <View
-      style={[
-        styles.honorCard,
-        red && styles.honorRed,
-        green && styles.honorGreen,
-        yellow && styles.honorYellow,
-      ]}
-    >
-      <View
-        style={[
-          styles.honorIcon,
-          {
-            backgroundColor: iconBackground,
-          },
-        ]}
-      >
-        <Text style={styles.honorIconText}>
-          {icon}
-        </Text>
+const Section = ({ icon, iconBg, iconColor, title, badge, children }) => (
+  <View style={styles.sectionCard}>
+    <View style={styles.sectionTopRow}>
+      <View style={styles.sectionTitleRow}>
+        <View style={[styles.sectionIcon, { backgroundColor: iconBg }]}>
+          <Text style={[styles.sectionIconText, { color: iconColor }]}>
+            {icon}
+          </Text>
+        </View>
+
+        <Text style={styles.sectionTitle}>{title}</Text>
       </View>
 
-      <Text style={styles.honorCardTitle}>
-        {title}
-      </Text>
-
-      {!!title2 && (
-        <Text style={styles.honorCardTitle}>
-          {title2}
-        </Text>
-      )}
-
-      <Text style={styles.honorDescription}>
-        {description}
-      </Text>
+      {badge ? (
+        <View style={[styles.sectionBadge, { backgroundColor: badge.bg }]}>
+          <Text style={[styles.sectionBadgeText, { color: badge.color }]}>
+            {badge.text}
+          </Text>
+        </View>
+      ) : null}
     </View>
-  );
-};
 
-const DocumentRow = ({
-  icon,
-  title,
-  subtitle,
-}) => {
-  return (
-    <View style={styles.documentRow}>
-      <View style={styles.documentIconBox}>
-        <Text style={styles.documentIcon}>
-          {icon}
-        </Text>
-      </View>
+    <View style={styles.sectionBody}>{children}</View>
+  </View>
+);
 
-      <View style={styles.documentContent}>
-        <Text style={styles.documentTitle}>
-          {title}
-        </Text>
-
-        <Text style={styles.documentSubtitle}>
-          {subtitle}
-        </Text>
-      </View>
-
-      <View style={styles.documentVerified}>
-        <Text style={styles.documentVerifiedText}>
-          ◉ Verified
-        </Text>
-      </View>
-    </View>
-  );
-};
-
-const LanguageButton = ({
-  title,
-  active,
-  onPress,
-}) => {
-  return (
-    <TouchableOpacity
-      activeOpacity={0.8}
-      style={[
-        styles.languageButton,
-        active && styles.languageButtonActive,
-      ]}
-      onPress={onPress}
+const InfoRow = ({ label, value, valueColor, last }) => (
+  <View style={[styles.infoRow, last && styles.infoRowLast]}>
+    <Text style={styles.infoLabel}>{label}</Text>
+    <Text
+      style={[styles.infoValue, valueColor && { color: valueColor }]}
+      numberOfLines={2}
     >
-      <Text
-        style={[
-          styles.languageButtonText,
-          active && styles.languageButtonTextActive,
-        ]}
-      >
-        {title}
-      </Text>
-    </TouchableOpacity>
-  );
-};
+      {value}
+    </Text>
+  </View>
+);
 
-const BottomNav = ({
-  icon,
-  title,
-  active,
-  onPress,
-}) => {
-  return (
-    <TouchableOpacity
-      activeOpacity={0.75}
-      style={styles.navItem}
-      onPress={onPress}
-    >
-      <Text
-        style={[
-          styles.navIcon,
-          active && styles.navIconActive,
-        ]}
-      >
-        {icon}
-      </Text>
+const BottomNav = ({ icon, title, active, onPress }) => (
+  <TouchableOpacity
+    activeOpacity={0.75}
+    style={styles.navItem}
+    onPress={onPress}
+  >
+    <Text style={[styles.navIcon, active && styles.navIconActive]}>{icon}</Text>
 
-      <Text
-        style={[
-          styles.navText,
-          active && styles.navTextActive,
-        ]}
-      >
-        {title}
-      </Text>
-    </TouchableOpacity>
-  );
-};
+    <Text style={[styles.navText, active && styles.navTextActive]}>
+      {title}
+    </Text>
+  </TouchableOpacity>
+);
 
 export default ProfileScreen;
 
@@ -1001,9 +544,9 @@ const styles = StyleSheet.create({
   },
 
   scrollContent: {
-    paddingHorizontal: rs(13),
-    paddingTop: rs(13),
-    paddingBottom: rs(100),
+    paddingHorizontal: rs(18),
+    paddingTop: rs(18),
+    paddingBottom: rs(40),
   },
 
   /* ==========================================================
@@ -1011,18 +554,26 @@ const styles = StyleSheet.create({
   ========================================================== */
 
   header: {
-    height: rs(51),
+    height: rs(72),
 
     backgroundColor: '#FFFFFF',
 
-    borderBottomWidth: 1,
-    borderBottomColor: '#E7EAF0',
+    borderBottomLeftRadius: rs(22),
+    borderBottomRightRadius: rs(22),
 
-    paddingHorizontal: rs(16),
+    paddingHorizontal: rs(20),
 
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+
+    shadowColor: '#000000',
+    shadowOpacity: 0.06,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+
+    elevation: 4,
+    zIndex: 1,
   },
 
   brandArea: {
@@ -1031,329 +582,222 @@ const styles = StyleSheet.create({
   },
 
   brandLogo: {
-    width: rs(34),
-    height: rs(34),
+    width: rs(42),
+    height: rs(42),
 
-    marginRight: rs(8),
+    marginRight: rs(10),
   },
 
   brandTitle: {
     color: DARK,
 
-    fontSize: fs(13),
+    fontSize: fs(18),
     fontWeight: '900',
   },
 
   brandSubtitle: {
-    color: '#64748B',
+    color: MUTED,
 
-    fontSize: fs(11),
+    fontSize: fs(12),
+    fontWeight: '600',
 
     marginTop: rs(1),
   },
 
-  headerRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-
-  dutyBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-
-    paddingHorizontal: rs(11),
+  headerEditButton: {
+    paddingHorizontal: rs(14),
     paddingVertical: rs(8),
 
-    borderRadius: rs(23),
+    borderRadius: rs(20),
 
-    backgroundColor: '#E8FFF5',
-
-    borderWidth: 1,
-    borderColor: '#A7EBCB',
-
-    marginRight: rs(10),
-  },
-
-  dutyDot: {
-    width: rs(7),
-    height: rs(7),
-
-    borderRadius: rs(4),
-
-    backgroundColor: GREEN,
-
-    marginRight: rs(5),
-  },
-
-  dutyText: {
-    color: '#174637',
-
-    fontSize: fs(9),
-    fontWeight: '900',
-
-    letterSpacing: 0.7,
-  },
-
-  headerProfile: {
-    width: rs(32),
-    height: rs(32),
-
-    borderRadius: rs(16),
+    backgroundColor: '#FFF0F0',
 
     borderWidth: 1,
-    borderColor: '#E7CBC2',
+    borderColor: '#FFC9C9',
+  },
+
+  headerEditText: {
+    color: RED,
+
+    fontSize: fs(13),
+    fontWeight: '800',
   },
 
   /* ==========================================================
-     PROFILE CARD
+     HERO
   ========================================================== */
 
-  profileCard: {
+  heroCard: {
+    backgroundColor: RED,
+
+    borderRadius: rs(22),
+
+    paddingVertical: rs(24),
+    paddingHorizontal: rs(20),
+
+    alignItems: 'center',
+
+    overflow: 'hidden',
+
+    shadowColor: RED,
+    shadowOpacity: 0.3,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+
+    elevation: 8,
+  },
+
+  heroCircleLarge: {
+    position: 'absolute',
+    top: -rs(70),
+    right: -rs(50),
+
+    width: rs(200),
+    height: rs(200),
+
+    borderRadius: rs(100),
+
+    backgroundColor: 'rgba(255,255,255,0.10)',
+  },
+
+  heroCircleSmall: {
+    position: 'absolute',
+    bottom: -rs(60),
+    left: -rs(40),
+
+    width: rs(140),
+    height: rs(140),
+
+    borderRadius: rs(70),
+
+    backgroundColor: 'rgba(255,255,255,0.07)',
+  },
+
+  avatar: {
+    width: rs(86),
+    height: rs(86),
+
+    borderRadius: rs(43),
+
     backgroundColor: '#FFFFFF',
 
-    borderWidth: 1,
-    borderColor: BORDER,
-
-    borderRadius: rs(14),
-
-    padding: rs(16),
-
-    shadowColor: '#000000',
-    shadowOpacity: 0.035,
-    shadowRadius: 5,
-
-    elevation: 2,
-  },
-
-  profileTop: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-  },
-
-  profilePhotoWrapper: {
-    position: 'relative',
-  },
-
-  profilePhoto: {
-    width: rs(61),
-    height: rs(61),
-
-    borderRadius: rs(31),
-
-    borderWidth: 1.5,
-    borderColor: '#E8C7BC',
-  },
-
-  verifiedMiniBadge: {
-    position: 'absolute',
-
-    bottom: -1,
-    right: -1,
-
-    width: rs(21),
-    height: rs(21),
-
-    borderRadius: rs(11),
-
-    backgroundColor: GREEN,
-
-    borderWidth: 2,
-    borderColor: '#FFFFFF',
+    borderWidth: 4,
+    borderColor: 'rgba(255,255,255,0.45)',
 
     alignItems: 'center',
     justifyContent: 'center',
   },
 
-  verifiedMiniText: {
+  avatarText: {
+    color: RED,
+
+    fontSize: fs(32),
+    fontWeight: '900',
+  },
+
+  heroName: {
     color: '#FFFFFF',
 
-    fontSize: fs(10),
+    fontSize: fs(24),
     fontWeight: '900',
+
+    marginTop: rs(12),
   },
 
-  profileInfo: {
-    flex: 1,
-
-    marginLeft: rs(14),
-  },
-
-  name: {
-    color: DARK,
+  heroEmail: {
+    color: 'rgba(255,255,255,0.9)',
 
     fontSize: fs(14),
-    fontWeight: '900',
-  },
-
-  captainId: {
-    color: '#E0051D',
-
-    fontSize: fs(10),
-    fontWeight: '800',
-
-    marginTop: rs(4),
-
-    letterSpacing: 0.3,
-  },
-
-  ratingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-
-    marginTop: rs(9),
-  },
-
-  ratingBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-
-    backgroundColor: '#FFF9E8',
-
-    borderWidth: 1,
-    borderColor: '#F5CE54',
-
-    borderRadius: rs(12),
-
-    paddingHorizontal: rs(7),
-    paddingVertical: rs(4),
-  },
-
-  ratingStar: {
-    color: '#E89800',
-
-    fontSize: fs(11),
-  },
-
-  ratingValue: {
-    color: DARK,
-
-    fontSize: fs(10),
-    fontWeight: '700',
-
-    marginLeft: rs(3),
-  },
-
-  deliveryCount: {
-    color: '#55637C',
-
-    fontSize: fs(9),
-
-    marginLeft: rs(5),
-  },
-
-  activeBadge: {
-    backgroundColor: '#DDF9EA',
-
-    paddingHorizontal: rs(8),
-    paddingVertical: rs(5),
-
-    borderRadius: rs(13),
-  },
-
-  activeText: {
-    color: '#087A4A',
-
-    fontSize: fs(9),
-    fontWeight: '900',
-  },
-
-  vehicleCard: {
-    marginTop: rs(14),
-
-    borderWidth: 1,
-    borderColor: BORDER,
-
-    backgroundColor: '#F8FAFD',
-
-    borderRadius: rs(10),
-
-    minHeight: rs(59),
-
-    paddingHorizontal: rs(12),
-
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-
-  vehicleIconBox: {
-    width: rs(34),
-    height: rs(34),
-
-    borderRadius: rs(8),
-
-    backgroundColor: '#FFFFFF',
-
-    borderWidth: 1,
-    borderColor: BORDER,
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(10),
-  },
-
-  vehicleIcon: {
-    fontSize: fs(17),
-  },
-
-  vehicleInfo: {
-    flex: 1,
-  },
-
-  vehicleName: {
-    color: DARK,
-
-    fontSize: fs(10),
-    fontWeight: '800',
-  },
-
-  vehicleNumber: {
-    color: MUTED,
-
-    fontSize: fs(9),
+    fontWeight: '600',
 
     marginTop: rs(3),
   },
 
-  vehicleVerified: {
-    paddingHorizontal: rs(8),
-    paddingVertical: rs(6),
+  heroChips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
 
-    borderRadius: rs(13),
+    marginTop: rs(14),
+  },
 
-    backgroundColor: '#E8FFF5',
+  heroChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+
+    backgroundColor: 'rgba(255,255,255,0.18)',
 
     borderWidth: 1,
-    borderColor: '#A5EAC9',
+    borderColor: 'rgba(255,255,255,0.3)',
+
+    borderRadius: rs(20),
+
+    paddingHorizontal: rs(12),
+    paddingVertical: rs(6),
+
+    marginHorizontal: rs(4),
+    marginBottom: rs(6),
   },
 
-  vehicleVerifiedText: {
-    color: '#087A4A',
+  heroChipText: {
+    color: '#FFFFFF',
 
-    fontSize: fs(9),
-    fontWeight: '700',
+    fontSize: fs(12),
+    fontWeight: '800',
   },
 
-  /* ==========================================================
-     COMMON SECTION
-  ========================================================== */
+  activeDot: {
+    width: rs(8),
+    height: rs(8),
 
-  sectionCard: {
-    marginTop: rs(14),
+    borderRadius: rs(4),
+
+    backgroundColor: '#5CF2B0',
+
+    marginRight: rs(6),
+  },
+
+  editButton: {
+    marginTop: rs(12),
+
+    height: rs(46),
+
+    paddingHorizontal: rs(28),
+
+    borderRadius: rs(23),
 
     backgroundColor: '#FFFFFF',
 
-    borderWidth: 1,
-    borderColor: BORDER,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 
-    borderRadius: rs(13),
+  editButtonText: {
+    color: RED,
+
+    fontSize: fs(15),
+    fontWeight: '900',
+  },
+
+  /* ==========================================================
+     SECTIONS
+  ========================================================== */
+
+  sectionCard: {
+    marginTop: rs(16),
+
+    backgroundColor: '#FFFFFF',
+
+    borderRadius: rs(16),
 
     padding: rs(16),
 
-    shadowColor: '#000',
-    shadowOpacity: 0.025,
-    shadowRadius: 4,
+    shadowColor: '#000000',
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
 
-    elevation: 1,
+    elevation: 3,
   },
 
   sectionTopRow: {
@@ -1367,738 +811,80 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
 
+  sectionIcon: {
+    width: rs(34),
+    height: rs(34),
+
+    borderRadius: rs(10),
+
+    alignItems: 'center',
+    justifyContent: 'center',
+
+    marginRight: rs(10),
+  },
+
+  sectionIconText: {
+    fontSize: fs(16),
+    fontWeight: '900',
+  },
+
   sectionTitle: {
     color: DARK,
 
-    fontSize: fs(10),
-    fontWeight: '800',
-  },
-
-  sectionSmallTitle: {
-    color: '#243047',
-
-    fontSize: fs(9),
-    fontWeight: '900',
-
-    letterSpacing: 0.8,
-  },
-
-  /* ==========================================================
-     WALLET
-  ========================================================== */
-
-  walletIcon: {
-    width: rs(21),
-    height: rs(21),
-
-    borderRadius: rs(6),
-
-    backgroundColor: '#FFE9E9',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(7),
-  },
-
-  walletIconText: {
-    color: RED,
-    fontSize: fs(11),
-  },
-
-  instantBadge: {
-    backgroundColor: '#E7FAF2',
-
-    borderRadius: rs(14),
-
-    paddingHorizontal: rs(8),
-    paddingVertical: rs(4),
-
-    borderWidth: 1,
-    borderColor: '#BCEBD6',
-  },
-
-  instantText: {
-    color: '#087D4C',
-
-    fontSize: fs(8),
-    fontWeight: '700',
-  },
-
-  walletHeader: {
-    marginTop: rs(15),
-
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-  },
-
-  balanceLabel: {
-    color: '#54627A',
-
-    fontSize: fs(9),
-  },
-
-  balanceAmount: {
-    marginTop: rs(3),
-
-    color: DARK,
-
-    fontSize: fs(26),
+    fontSize: fs(16),
     fontWeight: '900',
   },
 
-  tipBadge: {
-    backgroundColor: '#E6FAF1',
-
-    paddingHorizontal: rs(9),
+  sectionBadge: {
+    paddingHorizontal: rs(10),
     paddingVertical: rs(5),
 
-    borderRadius: rs(13),
+    borderRadius: rs(20),
   },
 
-  tipText: {
-    color: GREEN,
-
-    fontSize: fs(9),
-    fontWeight: '700',
-  },
-
-  bankCard: {
-    marginTop: rs(13),
-
-    minHeight: rs(58),
-
-    borderWidth: 1,
-    borderColor: BORDER,
-
-    borderRadius: rs(10),
-
-    backgroundColor: '#F8FAFD',
-
-    paddingHorizontal: rs(11),
-
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-
-  bankIconBox: {
-    width: rs(32),
-    height: rs(32),
-
-    borderRadius: rs(7),
-
-    backgroundColor: '#FFFFFF',
-
-    borderWidth: 1,
-    borderColor: BORDER,
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(9),
-  },
-
-  bankIcon: {
-    color: '#1C3657',
-
-    fontSize: fs(15),
-  },
-
-  bankInfo: {
-    flex: 1,
-  },
-
-  bankTitle: {
-    color: DARK,
-
-    fontSize: fs(9),
+  sectionBadgeText: {
+    fontSize: fs(11),
     fontWeight: '800',
   },
 
-  bankSubtitle: {
-    color: MUTED,
-
-    fontSize: fs(8),
-
-    marginTop: rs(3),
-  },
-
-  bankVerified: {
-    color: GREEN,
-
-    fontSize: fs(14),
-  },
-
-  withdrawButton: {
-    marginTop: rs(12),
-
-    height: rs(42),
-
-    backgroundColor: RED,
-
-    borderRadius: rs(8),
-
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    shadowColor: RED,
-    shadowOpacity: 0.18,
-    shadowRadius: 5,
-
-    elevation: 3,
-  },
-
-  withdrawIcon: {
-    color: '#FFFFFF',
-
-    marginRight: rs(7),
-
-    fontSize: fs(12),
-  },
-
-  withdrawText: {
-    color: '#FFFFFF',
-
-    fontSize: fs(10),
-    fontWeight: '900',
-  },
-
-  /* ==========================================================
-     HONOR
-  ========================================================== */
-
-  honorTitleRow: {
-    marginTop: rs(14),
-
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-
-    paddingHorizontal: rs(3),
-  },
-
-  honorTitle: {
-    color: DARK,
-
-    fontSize: fs(9),
-    fontWeight: '700',
-  },
-
-  tierBadge: {
-    borderWidth: 1,
-    borderColor: '#F0C856',
-
-    backgroundColor: '#FFF8DF',
-
-    borderRadius: rs(13),
-
-    paddingHorizontal: rs(8),
-    paddingVertical: rs(4),
-  },
-
-  tierText: {
-    color: '#985F00',
-
-    fontSize: fs(8),
-    fontWeight: '700',
-  },
-
-  honorRow: {
-    marginTop: rs(8),
-
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-
-  honorCard: {
-    width: '31.5%',
-
-    minHeight: rs(123),
-
-    borderRadius: rs(9),
-
-    alignItems: 'center',
-
-    paddingTop: rs(10),
-    paddingHorizontal: rs(4),
-
-    backgroundColor: '#FFFFFF',
-  },
-
-  honorRed: {
-    borderWidth: 1,
-    borderColor: '#F7D1D1',
-  },
-
-  honorGreen: {
-    borderWidth: 1,
-    borderColor: '#BFEBD6',
-  },
-
-  honorYellow: {
-    borderWidth: 1,
-    borderColor: '#F1D887',
-  },
-
-  honorIcon: {
-    width: rs(31),
-    height: rs(31),
-
-    borderRadius: rs(16),
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginBottom: rs(7),
-  },
-
-  honorIconText: {
-    fontSize: fs(14),
-  },
-
-  honorCardTitle: {
-    color: DARK,
-
-    fontSize: fs(9),
-    fontWeight: '800',
-
-    textAlign: 'center',
-
-    lineHeight: fs(12),
-  },
-
-  honorDescription: {
-    color: '#42516B',
-
-    fontSize: fs(8),
-
-    textAlign: 'center',
-
-    lineHeight: fs(13),
-
+  sectionBody: {
     marginTop: rs(8),
   },
 
-  /* ==========================================================
-     DOCUMENTS
-  ========================================================== */
-
-  greenSectionIcon: {
-    width: rs(21),
-    height: rs(21),
-
-    borderRadius: rs(7),
-
-    backgroundColor: '#E8FAF1',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(7),
-  },
-
-  greenSectionIconText: {
-    color: GREEN,
-
-    fontSize: fs(11),
-  },
-
-  allApprovedBadge: {
-    backgroundColor: '#DFF9EC',
-
-    paddingHorizontal: rs(8),
-    paddingVertical: rs(5),
-
-    borderRadius: rs(13),
-  },
-
-  allApprovedText: {
-    color: '#087A4A',
-
-    fontSize: fs(8),
-    fontWeight: '700',
-  },
-
-  documentRow: {
-    minHeight: rs(57),
-
-    marginTop: rs(9),
-
-    borderWidth: 1,
-    borderColor: BORDER,
-
-    borderRadius: rs(10),
-
-    backgroundColor: '#F8FAFD',
-
-    paddingHorizontal: rs(10),
-
+  infoRow: {
     flexDirection: 'row',
+    justifyContent: 'space-between',
     alignItems: 'center',
+
+    paddingVertical: rs(12),
+
+    borderBottomWidth: 1,
+    borderBottomColor: '#EEF1F5',
   },
 
-  documentIconBox: {
-    width: rs(28),
-    height: rs(28),
-
-    borderRadius: rs(7),
-
-    backgroundColor: '#FFFFFF',
-
-    borderWidth: 1,
-    borderColor: '#E2E8F0',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(8),
+  infoRowLast: {
+    borderBottomWidth: 0,
+    paddingBottom: rs(2),
   },
 
-  documentIcon: {
-    color: '#263D5A',
-
-    fontSize: fs(12),
-  },
-
-  documentContent: {
-    flex: 1,
-  },
-
-  documentTitle: {
-    color: DARK,
-
-    fontSize: fs(9),
-    fontWeight: '800',
-  },
-
-  documentSubtitle: {
+  infoLabel: {
     color: MUTED,
-
-    fontSize: fs(8),
-
-    marginTop: rs(3),
-  },
-
-  documentVerified: {
-    backgroundColor: '#E7FAF2',
-
-    borderWidth: 1,
-    borderColor: '#B3EBD1',
-
-    paddingHorizontal: rs(8),
-    paddingVertical: rs(5),
-
-    borderRadius: rs(13),
-  },
-
-  documentVerifiedText: {
-    color: '#087A4A',
-
-    fontSize: fs(8),
-    fontWeight: '700',
-  },
-
-  /* ==========================================================
-     DELIVERY GEAR
-  ========================================================== */
-
-  yellowSectionIcon: {
-    width: rs(21),
-    height: rs(21),
-
-    borderRadius: rs(7),
-
-    backgroundColor: '#FFF6D8',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(7),
-  },
-
-  yellowSectionIconText: {
-    color: '#CA8300',
-
-    fontSize: fs(11),
-  },
-
-  settingCard: {
-    minHeight: rs(59),
-
-    marginTop: rs(10),
-
-    borderWidth: 1,
-    borderColor: BORDER,
-
-    borderRadius: rs(10),
-
-    backgroundColor: '#F8FAFD',
-
-    paddingHorizontal: rs(10),
-
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-
-  settingIconRed: {
-    width: rs(30),
-    height: rs(30),
-
-    borderRadius: rs(8),
-
-    backgroundColor: '#FFE8E8',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(9),
-  },
-
-  settingIconText: {
-    color: RED,
 
     fontSize: fs(13),
+    fontWeight: '600',
+
+    marginRight: rs(12),
   },
 
-  settingIconBlue: {
-    width: rs(30),
-    height: rs(30),
+  infoValue: {
+    flex: 1,
 
-    borderRadius: rs(8),
-
-    backgroundColor: '#EBEFFF',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(9),
-  },
-
-  settingIconTextBlue: {
-    color: '#273EFF',
+    color: DARK,
 
     fontSize: fs(14),
-  },
-
-  settingContent: {
-    flex: 1,
-  },
-
-  settingTitle: {
-    color: DARK,
-
-    fontSize: fs(9),
     fontWeight: '800',
-  },
 
-  settingSubtitle: {
-    color: MUTED,
-
-    fontSize: fs(8),
-
-    marginTop: rs(3),
-  },
-
-  greenCheck: {
-    color: GREEN,
-
-    fontSize: fs(15),
-  },
-
-  /* ==========================================================
-     PREFERENCES
-  ========================================================== */
-
-  preferenceIcon: {
-    width: rs(21),
-    height: rs(21),
-
-    borderRadius: rs(7),
-
-    backgroundColor: '#EDF3F9',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(7),
-  },
-
-  preferenceIconText: {
-    color: '#31445C',
-
-    fontSize: fs(12),
-  },
-
-  languageCard: {
-    marginTop: rs(10),
-
-    borderWidth: 1,
-    borderColor: BORDER,
-
-    borderRadius: rs(10),
-
-    padding: rs(10),
-
-    backgroundColor: '#F8FAFD',
-  },
-
-  languageTop: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-
-  languageLabelRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-
-  globeIcon: {
-    color: '#425979',
-
-    fontSize: fs(12),
-
-    marginRight: rs(6),
-  },
-
-  languageTitle: {
-    color: DARK,
-
-    fontSize: fs(9),
-    fontWeight: '700',
-  },
-
-  activeLanguage: {
-    color: '#20314B',
-
-    fontSize: fs(8),
-    fontWeight: '700',
-  },
-
-  languageButtons: {
-    marginTop: rs(8),
-
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-
-  languageButton: {
-    width: '31%',
-
-    height: rs(31),
-
-    borderRadius: rs(5),
-
-    borderWidth: 1,
-    borderColor: '#D7DFE8',
-
-    backgroundColor: '#FFFFFF',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-
-  languageButtonActive: {
-    backgroundColor: RED,
-
-    borderColor: RED,
-  },
-
-  languageButtonText: {
-    color: '#394961',
-
-    fontSize: fs(8),
-    fontWeight: '700',
-  },
-
-  languageButtonTextActive: {
-    color: '#FFFFFF',
-  },
-
-  preferenceRow: {
-    minHeight: rs(59),
-
-    marginTop: rs(10),
-
-    borderWidth: 1,
-    borderColor: BORDER,
-
-    borderRadius: rs(10),
-
-    backgroundColor: '#F8FAFD',
-
-    paddingHorizontal: rs(10),
-
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-
-  sosCircle: {
-    width: rs(31),
-    height: rs(31),
-
-    borderRadius: rs(16),
-
-    backgroundColor: '#FFE5E5',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(9),
-  },
-
-  sosCircleText: {
-    color: RED,
-
-    fontSize: fs(17),
-    fontWeight: '900',
-  },
-
-  contactCircle: {
-    width: rs(31),
-    height: rs(31),
-
-    borderRadius: rs(16),
-
-    backgroundColor: '#EDF2F8',
-
-    alignItems: 'center',
-    justifyContent: 'center',
-
-    marginRight: rs(9),
-  },
-
-  contactCircleText: {
-    color: '#42546B',
-
-    fontSize: fs(13),
-  },
-
-  preferenceContent: {
-    flex: 1,
-  },
-
-  preferenceTitle: {
-    color: DARK,
-
-    fontSize: fs(9),
-    fontWeight: '800',
-  },
-
-  preferenceSubtitle: {
-    color: MUTED,
-
-    fontSize: fs(8),
-
-    marginTop: rs(3),
-  },
-
-  chevron: {
-    color: '#8390A5',
-
-    fontSize: fs(18),
+    textAlign: 'right',
   },
 
   /* ==========================================================
@@ -2106,14 +892,14 @@ const styles = StyleSheet.create({
   ========================================================== */
 
   logoutButton: {
-    height: rs(43),
+    height: rs(54),
 
-    marginTop: rs(16),
+    marginTop: rs(20),
 
-    borderWidth: 1,
+    borderWidth: 1.5,
     borderColor: '#FFBABA',
 
-    borderRadius: rs(9),
+    borderRadius: rs(14),
 
     backgroundColor: '#FFFFFF',
 
@@ -2125,27 +911,26 @@ const styles = StyleSheet.create({
   logoutIcon: {
     color: RED,
 
-    fontSize: fs(13),
+    fontSize: fs(18),
 
-    marginRight: rs(7),
+    marginRight: rs(8),
   },
 
   logoutText: {
     color: RED,
 
-    fontSize: fs(9),
-    fontWeight: '700',
+    fontSize: fs(15),
+    fontWeight: '800',
   },
 
   versionText: {
     color: '#8291A9',
 
-    fontSize: fs(8),
+    fontSize: fs(12),
 
     textAlign: 'center',
 
-    marginTop: rs(20),
-    marginBottom: rs(3),
+    marginTop: rs(18),
   },
 
   /* ==========================================================
@@ -2153,7 +938,7 @@ const styles = StyleSheet.create({
   ========================================================== */
 
   bottomNav: {
-    height: rs(66),
+    height: rs(76),
 
     backgroundColor: '#FFFFFF',
 
@@ -2177,7 +962,7 @@ const styles = StyleSheet.create({
   navIcon: {
     color: '#61738E',
 
-    fontSize: fs(15),
+    fontSize: fs(20),
   },
 
   navIconActive: {
@@ -2187,7 +972,8 @@ const styles = StyleSheet.create({
   navText: {
     color: '#61738E',
 
-    fontSize: fs(6.8),
+    fontSize: fs(10),
+    fontWeight: '600',
 
     marginTop: rs(4),
   },

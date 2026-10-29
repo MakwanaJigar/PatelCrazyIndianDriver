@@ -1,8 +1,11 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import RootStackNavigator from './RootStackNavigator';
+import { navigationRef } from './navigationRef';
+import { initPushNotifications } from '../notifications/push';
+import { AppAlertHost } from '../components/AppAlert';
 
 // ============================================================
 // APP NAVIGATOR (entry point of all navigation)
@@ -11,17 +14,21 @@ import RootStackNavigator from './RootStackNavigator';
 //                            Android + iOS (notch, status bar,
 //                            gesture bar)
 //   NavigationContainer   -> holds navigation state
+//   AppAlertHost          -> themed popups (showAlert)
 //   RootStackNavigator    -> Splash -> MainTabs
-//     BottomTabNavigator  -> Home / Orders / Live Map /
-//                            History / Profile
+//     BottomTabNavigator  -> Home / History / Profile
 // ============================================================
 
 const AppNavigator = () => {
+  // Notification permission + foreground / tap handlers
+  useEffect(() => initPushNotifications(navigationRef), []);
+
   return (
     <SafeAreaProvider>
-      <NavigationContainer>
+      <NavigationContainer ref={navigationRef}>
         <RootStackNavigator />
       </NavigationContainer>
+      <AppAlertHost />
     </SafeAreaProvider>
   );
 };

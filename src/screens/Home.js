@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -9,16 +9,59 @@ import {
   Animated,
   Easing,
   Dimensions,
-  Image,
+  RefreshControl,
+  ActivityIndicator,
 } from 'react-native';
+import { showAlert } from '../components/AppAlert';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { WebView } from 'react-native-webview';
+import { useFocusEffect } from '@react-navigation/native';
+import { clearSession } from '../api/session';
+import { subscribeToPushes } from '../notifications/push';
 import { createScaler } from '../utils/responsive';
 import { ROUTES } from '../navigation/routes';
+import AppHeader from '../components/AppHeader';
+import RouteMap, { startRouteNavigation } from '../components/RouteMap';
+import { useSmartRoute } from '../data/useSmartRoute';
+import { formatKm } from '../utils/smartRoute';
+import {
+  ORDER_STATUS,
+  PICKUP_LOCATION,
+  useOrders,
+  loadOrders,
+  useOrdersAutoRefresh,
+  countByStatus,
+  itemCount,
+} from '../data/orders';
 
 const { width } = Dimensions.get('window');
 
 const DESIGN_WIDTH = 452;
 const { rs, fs } = createScaler(DESIGN_WIDTH);
+
+const ADELAIDE_MAP_EMBED_URL =
+  'https://www.google.com/maps/embed?pb=!1m18!1m12!1m3!1d418336.6396460062!2d138.2815079343055!3d-35.0003213760432!2m3!1f0!2f0!3f0!3m2!1i1024!2i768!4f13.1!3m3!1m2!1s0x6ab735c7c526b33f%3A0x4033654628ec640!2sAdelaide%20SA%2C%20Australia!5e0!3m2!1sen!2sin!4v1791801116916!5m2!1sen!2sin';
+
+const ADELAIDE_MAP_HTML = `
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+      iframe { border: 0; width: 100%; height: 100%; }
+    </style>
+  </head>
+  <body>
+    <iframe
+      src="${ADELAIDE_MAP_EMBED_URL}"
+      allowfullscreen=""
+      loading="lazy"
+      referrerpolicy="strict-origin-when-cross-origin"
+    ></iframe>
+  </body>
+</html>
+`;
 
 const RED = '#E92025';
 const GREEN = '#078B53';
@@ -27,7 +70,77 @@ const MUTED = '#61708B';
 const BORDER = '#DCE3EC';
 const BG = '#F7F9FC';
 
+// e.g. "Tue, 13 Oct"
+const getTodayLabel = () => {
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const months = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+  ];
+  const d = new Date();
+  return `${days[d.getDay()]}, ${d.getDate()} ${months[d.getMonth()]}`;
+};
+
 const HomeScreen = ({ navigation }) => {
+  // Assigned orders from GET /driver/orders/assigned
+  const [ordersLoading, setOrdersLoading] = useState(true);
+  const [ordersError, setOrdersError] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // silent: background auto-refresh, keeps the current list on errors
+  const refreshOrders = useCallback(
+    async ({ silent } = {}) => {
+      try {
+        await loadOrders();
+        setOrdersError(null);
+      } catch (e) {
+        if (e.status === 401) {
+          await clearSession().catch(() => {});
+          showAlert('Session expired', 'Please log in again.', [], {
+            type: 'warning',
+          });
+          navigation.reset({ index: 0, routes: [{ name: ROUTES.LOGIN }] });
+          return;
+        }
+        if (!silent) {
+          setOrdersError(e.message);
+        }
+      } finally {
+        setOrdersLoading(false);
+      }
+    },
+    [navigation],
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      refreshOrders();
+    }, [refreshOrders]),
+  );
+
+  // A push (e.g. a new dispatch) may mean a newly assigned order
+  useEffect(() => subscribeToPushes(() => refreshOrders()), [refreshOrders]);
+
+  // Home stays mounted under the other tabs / Order Details, so this
+  // keeps every screen that reads the orders store up to date
+  useOrdersAutoRefresh(() => refreshOrders({ silent: true }));
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await refreshOrders();
+    setRefreshing(false);
+  };
+
   const headerOpacity = useRef(new Animated.Value(0)).current;
   const headerY = useRef(new Animated.Value(-20)).current;
 
@@ -213,67 +326,49 @@ const HomeScreen = ({ navigation }) => {
     };
   }, []);
 
+  const orders = useOrders();
+
+  const totalCount = orders.length;
+  const deliveredCount = countByStatus(orders, 'delivered');
+
+  // Delivered orders move out of the pending list into their own
+  const pendingOrders = orders.filter(o => o.status !== 'delivered');
+  const deliveredOrders = orders.filter(o => o.status === 'delivered');
+
+  // Smart Route: from the pickup, pending orders nearest first, then
+  // nearest to that one, ... (see data/useSmartRoute.js). Until the route is ready,
+  // or for orders it couldn't place, the server's order is kept.
+  const smartRoute = useSmartRoute(pendingOrders);
+  const routeStops = smartRoute.route?.stops ?? [];
+  const stopById = {};
+  routeStops.forEach((stop, i) => {
+    stopById[stop.order.id] = { number: i + 1, legKm: stop.legKm };
+  });
+  const routedPending = [
+    ...routeStops
+      .map(stop => pendingOrders.find(o => o.id === stop.order.id))
+      .filter(Boolean),
+    ...pendingOrders.filter(o => !stopById[o.id]),
+  ];
+  const deliveredPercent = totalCount
+    ? Math.round((deliveredCount / totalCount) * 100)
+    : 0;
+
   return (
     <SafeAreaView style={styles.safeArea}>
-      <StatusBar
-        barStyle="dark-content"
-        backgroundColor="#FFFFFF"
-      />
+      <StatusBar barStyle="dark-content" backgroundColor="#FFFFFF" />
 
       <View style={styles.screen}>
         {/* =====================================================
             HEADER
         ===================================================== */}
 
-        <Animated.View
-          style={[
-            styles.header,
-            {
-              opacity: headerOpacity,
-              transform: [{ translateY: headerY }],
-            },
-          ]}
-        >
-          <View style={styles.brandArea}>
-            <Image
-              source={require('../assets/logo.png')}
-              style={styles.brandLogo}
-              resizeMode="contain"
-            />
-
-            <View>
-              <Text style={styles.brandTitle}>
-                Patel’s Driver
-              </Text>
-
-              <Text style={styles.brandSubtitle}>
-                Home
-              </Text>
-            </View>
-          </View>
-
-          <View style={styles.headerRight}>
-            <Animated.View
-              style={[
-                styles.dutyBadge,
-                {
-                  transform: [{ scale: dutyPulse }],
-                },
-              ]}
-            >
-              <View style={styles.dutyDot} />
-
-              <Text style={styles.dutyText}>
-                ON DUTY
-              </Text>
-            </Animated.View>
-
-            <Image
-              source={require('../assets/logo.png')}
-              style={styles.profileImage}
-            />
-          </View>
-        </Animated.View>
+        <AppHeader
+          style={{
+            opacity: headerOpacity,
+            transform: [{ translateY: headerY }],
+          }}
+        />
 
         {/* =====================================================
             MAIN SCROLL
@@ -282,477 +377,212 @@ const HomeScreen = ({ navigation }) => {
         <ScrollView
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.scrollContent}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              colors={[RED]}
+              tintColor={RED}
+            />
+          }
         >
           {/* =====================================================
-              SHIFT PAYOUT
-          ===================================================== */}
-
-          <Animated.View
-            style={[
-              styles.card,
-              {
-                opacity: payoutOpacity,
-                transform: [{ translateY: payoutY }],
-              },
-            ]}
-          >
-            <View style={styles.cardHeaderRow}>
-              <View style={styles.smallTitleRow}>
-                <Text style={styles.orangeIcon}>▣</Text>
-
-                <Text style={styles.smallHeading}>
-                  TODAY’S SHIFT PAYOUT
-                </Text>
-              </View>
-
-              <View style={styles.autoBadge}>
-                <View style={styles.autoDot} />
-
-                <Text style={styles.autoText}>
-                  Auto-Settled
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.earningRow}>
-              <Text style={styles.payoutAmount}>
-                ₹1,850
-              </Text>
-
-              <Text style={styles.payoutDecimal}>
-                .50
-              </Text>
-
-              <View style={styles.growthBadge}>
-                <Text style={styles.growthText}>
-                  ↗ +18.4%
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.shiftStats}>
-              <View style={styles.shiftStatBox}>
-                <View style={styles.statIconRed}>
-                  <Text style={styles.statIconText}>🏍</Text>
-                </View>
-
-                <View>
-                  <Text style={styles.statBig}>
-                    12
-                  </Text>
-
-                  <Text style={styles.statSmall}>
-                    Trips Done
-                  </Text>
-                </View>
-              </View>
-
-              <View style={styles.shiftStatBox}>
-                <View style={styles.statIconYellow}>
-                  <Text style={styles.statIconText}>☆</Text>
-                </View>
-
-                <View>
-                  <Text style={styles.statBig}>
-                    4.92
-                  </Text>
-
-                  <Text style={styles.statSmall}>
-                    Super Star
-                  </Text>
-                </View>
-              </View>
-            </View>
-          </Animated.View>
-
-          {/* =====================================================
-              ONLINE CARD
-          ===================================================== */}
-
-          <Animated.View
-            style={[
-              styles.onlineCard,
-              {
-                opacity: onlineOpacity,
-                transform: [{ translateY: onlineY }],
-              },
-            ]}
-          >
-            <View style={styles.onlineLeft}>
-              <View style={styles.onlineIconOuter}>
-                <View style={styles.onlineIconInner}>
-                  <Text style={styles.onlineIconText}>
-                    ◎
-                  </Text>
-                </View>
-              </View>
-
-              <View>
-                <Text style={styles.onlineTitle}>
-                  YOU ARE ONLINE
-                </Text>
-
-                <Text
-                  numberOfLines={1}
-                  style={styles.onlineSubtitle}
-                >
-                  Ready for fresh pickup broad...
-                </Text>
-              </View>
-            </View>
-
-            <TouchableOpacity
-              activeOpacity={0.8}
-              style={styles.pauseButton}
-            >
-              <Text style={styles.pauseText}>
-                Pause
-              </Text>
-
-              <Text style={styles.powerText}>
-                ⏻
-              </Text>
-            </TouchableOpacity>
-          </Animated.View>
-
-          {/* =====================================================
-              ORDER CARD
-          ===================================================== */}
-
-          <Animated.View
-            style={[
-              styles.orderCard,
-              {
-                opacity: orderOpacity,
-                transform: [
-                  { scale: orderScale },
-                  { scale: orderPulse },
-                ],
-              },
-            ]}
-          >
-            <View style={styles.orderTop}>
-              <View style={styles.orderTopLeft}>
-                <View style={styles.hotIconBox}>
-                  <Text style={styles.hotIcon}>
-                    ♨
-                  </Text>
-                </View>
-
-                <View style={styles.orderHeaderText}>
-                  <View style={styles.surgeRow}>
-                    <View style={styles.surgeBadge}>
-                      <Text style={styles.surgeBadgeText}>
-                        HIGH SURGE 1.3X
-                      </Text>
-                    </View>
-
-                    <Text style={styles.hotSpotText}>
-                      HOT POT
-                    </Text>
-                  </View>
-
-                  <Text style={styles.restaurantName}>
-                    Patel’s Grand Palace
-                  </Text>
-                </View>
-              </View>
-
-              <View style={styles.timerCircle}>
-                <Text style={styles.timerText}>
-                  39s
-                </Text>
-              </View>
-            </View>
-
-            {/* ORDER FOOD */}
-
-            <View style={styles.foodBox}>
-              <Image
-                source={require('../assets/logo.png')}
-                style={styles.foodImage}
-                resizeMode="cover"
-              />
-
-              <View style={styles.foodContent}>
-                <Text style={styles.foodTitle}>
-                  ▣ 2 Items (Signature Feast)
-                </Text>
-
-                <Text
-                  numberOfLines={1}
-                  style={styles.foodDescription}
-                >
-                  Murg Butter Handi + 3x Butter Garlic ...
-                </Text>
-
-                <Text style={styles.foodWarning}>
-                  Contains Rich Gravy • Keep Upright
-                </Text>
-              </View>
-            </View>
-
-            {/* ORDER META */}
-
-            <View style={styles.orderInfoRow}>
-              <View style={styles.infoBox}>
-                <Text style={styles.infoLabel}>
-                  ✈ Drop Distance
-                </Text>
-
-                <Text style={styles.infoValue}>
-                  3.2 km
-                  <Text style={styles.infoMinor}>
-                    {' '} (14 mins)
-                  </Text>
-                </Text>
-              </View>
-
-              <View style={styles.infoBox}>
-                <Text style={styles.infoLabelGreen}>
-                  ₹ Net Payout
-                </Text>
-
-                <Text style={styles.infoValueGreen}>
-                  ₹140.00
-                </Text>
-              </View>
-            </View>
-
-            {/* PICKUP */}
-
-            <View style={styles.pickupBar}>
-              <Text style={styles.pickupIcon}>
-                ▥
-              </Text>
-
-              <Text
-                numberOfLines={1}
-                style={styles.pickupText}
-              >
-                Pick up at Sector 4 Food Hub, Kitchen Count...
-              </Text>
-            </View>
-
-            {/* ACTIONS */}
-
-            <View style={styles.actionRow}>
-              <TouchableOpacity
-                activeOpacity={0.8}
-                style={styles.declineButton}
-              >
-                <Text style={styles.declineText}>
-                  Decline
-                </Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                activeOpacity={0.85}
-                style={styles.acceptButton}
-              >
-                <Text style={styles.acceptIcon}>
-                  ✓
-                </Text>
-
-                <Text style={styles.acceptText}>
-                  ACCEPT ORDER
-                </Text>
-              </TouchableOpacity>
-            </View>
-          </Animated.View>
-
-          {/* =====================================================
-              RELIABILITY
+              TODAY'S SUMMARY
           ===================================================== */}
 
           <Animated.View
             style={{
-              opacity: metricsOpacity,
-              transform: [{ translateY: metricsY }],
+              opacity: payoutOpacity,
+              transform: [{ translateY: payoutY }],
             }}
           >
-            <View style={styles.sectionHeadingRow}>
-              <Text style={styles.sectionHeading}>
-                DAILY RELIABILITY TARGETS
-              </Text>
+            {/* HERO: total orders + delivery progress */}
 
-              <Text style={styles.liveText}>
-                Live Metrics
-              </Text>
-            </View>
+            <View style={styles.heroCard}>
+              <View style={styles.heroCircleLarge} />
+              <View style={styles.heroCircleSmall} />
 
-            <View style={styles.metricsRow}>
-              <MetricCard
-                icon="♧"
-                iconBg="#E6F9F1"
-                value="96%"
-                label="Acceptance"
-              />
-
-              <MetricCard
-                icon="◴"
-                iconBg="#FFF5E3"
-                value="98%"
-                label="On-Time"
-              />
-
-              <MetricCard
-                icon="▤"
-                iconBg="#E5FAF0"
-                value="₹300"
-                label="Bonus Won"
-                green
-              />
-            </View>
-          </Animated.View>
-
-          {/* =====================================================
-              COD
-          ===================================================== */}
-
-          <Animated.View
-            style={[
-              styles.codCard,
-              {
-                opacity: codOpacity,
-                transform: [{ translateY: codY }],
-              },
-            ]}
-          >
-            <View style={styles.codLeft}>
-              <View style={styles.codIconBox}>
-                <Text style={styles.codIcon}>
-                  ▣
-                </Text>
-              </View>
-
-              <View style={styles.codInfo}>
-                <Text style={styles.codTitle}>
-                  COD: ₹820.00
-                  <Text style={styles.codDot}>
-                    {' '}●
-                  </Text>
-                </Text>
-
-                <Text
-                  numberOfLines={1}
-                  style={styles.codSubtitle}
-                >
-                  Deposit due before 11:30 PM cut...
-                </Text>
-              </View>
-            </View>
-
-            <TouchableOpacity
-              style={styles.depositButton}
-              activeOpacity={0.8}
-            >
-              <Text style={styles.depositText}>
-                Deposit
-              </Text>
-            </TouchableOpacity>
-          </Animated.View>
-
-          {/* =====================================================
-              TOOLS
-          ===================================================== */}
-
-          <Animated.View
-            style={[
-              styles.toolsRow,
-              {
-                opacity: toolsOpacity,
-                transform: [{ translateY: toolsY }],
-              },
-            ]}
-          >
-            <TouchableOpacity
-              activeOpacity={0.8}
-              style={styles.toolCard}
-            >
-              <View style={styles.hotZoneIcon}>
-                <Text style={styles.hotZoneIconText}>
-                  ♨
-                </Text>
-              </View>
-
-              <View style={styles.toolContent}>
-                <Text style={styles.toolTitle}>
-                  Hot Zones
-                </Text>
-
-                <Text
-                  numberOfLines={1}
-                  style={styles.toolSubtitle}
-                >
-                  4 High Surge s...
-                </Text>
-              </View>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              activeOpacity={0.8}
-              style={styles.toolCard}
-            >
-              <View style={styles.sosIcon}>
-                <Text style={styles.sosIconText}>
-                  SOS
-                </Text>
-              </View>
-
-              <View style={styles.toolContent}>
-                <Text style={styles.toolTitle}>
-                  Quick SOS
-                </Text>
-
-                <Text
-                  numberOfLines={1}
-                  style={styles.sosSubtitle}
-                >
-                  Patel Support t...
-                </Text>
-              </View>
-            </TouchableOpacity>
-          </Animated.View>
-
-          {/* =====================================================
-              MAP / HEATMAP
-          ===================================================== */}
-
-          <Animated.View
-            style={[
-              styles.mapCard,
-              {
-                opacity: mapOpacity,
-                transform: [{ translateY: mapY }],
-              },
-            ]}
-          >
-            <View style={styles.mapHeader}>
-              <View style={styles.mapTitleRow}>
-                <View style={styles.mapIconBox}>
-                  <Text style={styles.mapIconText}>
-                    ◎
-                  </Text>
+              <View style={styles.heroTopRow}>
+                <View>
+                  <Text style={styles.heroLabel}>TODAY'S TOTAL ORDERS</Text>
+                  <Text style={styles.heroValue}>{totalCount}</Text>
                 </View>
 
-                <Text style={styles.mapTitle}>
-                  Surge Heatmap: Bandra{'\n'}West
-                </Text>
+                <View style={styles.heroDateChip}>
+                  <Text style={styles.heroDateText}>{getTodayLabel()}</Text>
+                </View>
               </View>
 
-              <View style={styles.liveTrafficBadge}>
-                <Text style={styles.liveTrafficText}>
-                  Live{'\n'}Traffic
+              <View style={styles.heroProgressTrack}>
+                <View
+                  style={[
+                    styles.heroProgressFill,
+                    { width: `${deliveredPercent}%` },
+                  ]}
+                />
+              </View>
+
+              <View style={styles.heroBottomRow}>
+                <Text style={styles.heroProgressText}>
+                  {deliveredCount} of {totalCount} delivered
                 </Text>
+
+                <Text style={styles.heroPercentText}>{deliveredPercent}%</Text>
               </View>
             </View>
 
-            <Image
-              source={require('../assets/logo.png')}
-              style={styles.mapImage}
-              resizeMode="cover"
-            />
+            {/* STATUS BREAKDOWN */}
+
+            <View style={styles.statusGrid}>
+              <StatusCard
+                icon="✓"
+                status={ORDER_STATUS.delivered}
+                value={deliveredCount}
+                label="Delivered"
+              />
+
+              <StatusCard
+                icon="◴"
+                status={ORDER_STATUS.pending}
+                value={countByStatus(orders, 'pending')}
+                label="Pending"
+              />
+
+              <StatusCard
+                icon="➤"
+                status={ORDER_STATUS.ready}
+                value={countByStatus(orders, 'ready')}
+                label={'Ready for\nDispatch'}
+              />
+            </View>
+          </Animated.View>
+
+          {/* =====================================================
+              TODAY'S ORDERS
+          ===================================================== */}
+
+          <Animated.View
+            style={{
+              opacity: onlineOpacity,
+              transform: [{ translateY: onlineY }],
+            }}
+          >
+            {pendingOrders.length ? (
+              <SmartRouteCard
+                smartRoute={smartRoute}
+                onOpen={() => navigation.navigate(ROUTES.SMART_ROUTE)}
+              />
+            ) : null}
+
+            <View style={styles.sectionHeadingRow}>
+              <View style={styles.sectionTitleRow}>
+                <Text style={styles.sectionHeading}>Pending Orders</Text>
+
+                <View style={styles.countChip}>
+                  <Text style={styles.countChipText}>
+                    {pendingOrders.length}
+                  </Text>
+                </View>
+              </View>
+
+              {routeStops.length ? (
+                <Text style={styles.routeOrderHint}>Nearest first</Text>
+              ) : null}
+            </View>
+
+            <View style={styles.ordersList}>
+              {totalCount === 0 ? (
+                ordersLoading ? (
+                  <ActivityIndicator color={RED} style={styles.ordersLoader} />
+                ) : (
+                  <View style={styles.ordersEmpty}>
+                    <Text style={styles.ordersEmptyIcon}>
+                      {ordersError ? '⚠' : '🛵'}
+                    </Text>
+                    <Text style={styles.ordersEmptyTitle}>
+                      {ordersError
+                        ? 'Could not load orders'
+                        : 'No orders assigned yet'}
+                    </Text>
+                    <Text style={styles.ordersEmptyText}>
+                      {ordersError ||
+                        'New orders assigned to you will show up here.'}
+                    </Text>
+                    {ordersError ? (
+                      <TouchableOpacity
+                        activeOpacity={0.85}
+                        style={styles.ordersRetryButton}
+                        onPress={onRefresh}
+                      >
+                        <Text style={styles.ordersRetryText}>Try Again</Text>
+                      </TouchableOpacity>
+                    ) : null}
+                  </View>
+                )
+              ) : pendingOrders.length === 0 ? (
+                <View style={styles.ordersEmpty}>
+                  <Text style={styles.ordersEmptyIcon}>🎉</Text>
+                  <Text style={styles.ordersEmptyTitle}>
+                    All orders delivered
+                  </Text>
+                  <Text style={styles.ordersEmptyText}>
+                    Great job! New orders assigned to you will show up here.
+                  </Text>
+                </View>
+              ) : null}
+
+              {routedPending.map(order => (
+                <TodayOrderCard
+                  key={order.id}
+                  order={order}
+                  stop={stopById[order.id]}
+                  onPress={() =>
+                    navigation.navigate(ROUTES.ORDER_DETAILS, {
+                      orderId: order.id,
+                    })
+                  }
+                />
+              ))}
+            </View>
+
+            {/* DELIVERED SUCCESSFULLY */}
+
+            {deliveredOrders.length > 0 ? (
+              <>
+                <View style={styles.sectionHeadingRow}>
+                  <View style={styles.sectionTitleRow}>
+                    <Text style={styles.sectionHeading}>
+                      Delivered Successfully
+                    </Text>
+
+                    <View style={[styles.countChip, styles.countChipGreen]}>
+                      <Text
+                        style={[
+                          styles.countChipText,
+                          styles.countChipTextGreen,
+                        ]}
+                      >
+                        {deliveredOrders.length}
+                      </Text>
+                    </View>
+                  </View>
+                </View>
+
+                <View style={styles.ordersList}>
+                  {deliveredOrders.map(order => (
+                    <TodayOrderCard
+                      key={order.id}
+                      order={order}
+                      onPress={() =>
+                        navigation.navigate(ROUTES.ORDER_DETAILS, {
+                          orderId: order.id,
+                        })
+                      }
+                    />
+                  ))}
+                </View>
+              </>
+            ) : null}
           </Animated.View>
         </ScrollView>
 
@@ -766,18 +596,6 @@ const HomeScreen = ({ navigation }) => {
             label="Home"
             active
             onPress={() => navigation.navigate(ROUTES.HOME)}
-          />
-
-          <BottomNav
-            icon="♧"
-            label="Orders"
-            onPress={() => navigation.navigate(ROUTES.ORDERS)}
-          />
-
-          <BottomNav
-            icon="◎"
-            label="Live Map"
-            onPress={() => navigation.navigate(ROUTES.LIVE_MAP)}
           />
 
           <BottomNav
@@ -797,13 +615,227 @@ const HomeScreen = ({ navigation }) => {
   );
 };
 
-const MetricCard = ({
-  icon,
-  iconBg,
-  value,
-  label,
-  green,
-}) => (
+const StatusCard = ({ icon, status, value, label }) => (
+  <View style={styles.statusCard}>
+    <View style={[styles.statusAccent, { backgroundColor: status.color }]} />
+
+    <View style={[styles.statusIcon, { backgroundColor: status.bg }]}>
+      <Text style={[styles.statusIconText, { color: status.color }]}>
+        {icon}
+      </Text>
+    </View>
+
+    <Text style={styles.statusValue}>{value}</Text>
+
+    <Text numberOfLines={2} style={styles.statusLabel}>
+      {label}
+    </Text>
+  </View>
+);
+
+const getInitials = name =>
+  name
+    .split(' ')
+    .map(part => part[0])
+    .join('')
+    .slice(0, 2)
+    .toUpperCase();
+
+// Map + "Start Navigation" for the smart route through every
+// pending order; "Full route" opens the Smart Route screen
+const SmartRouteCard = ({ smartRoute, onOpen }) => {
+  const { phase, progress, start, route } = smartRoute;
+  const stops = route?.stops ?? [];
+  const ready = phase === 'ready' && stops.length > 0;
+
+  let status;
+  if (phase === 'geocoding') {
+    status = progress.total
+      ? `Locating address ${progress.done} of ${progress.total}…`
+      : 'Planning the shortest route…';
+  } else if (!stops.length) {
+    status = "Couldn't find these addresses on the map.";
+  } else {
+    status = `From ${PICKUP_LOCATION} · ${stops.length} stop${
+      stops.length === 1 ? '' : 's'
+    } · ${formatKm(route.totalKm)}`;
+  }
+
+  return (
+    <View style={styles.smartRouteCard}>
+      <View style={styles.smartRouteTop}>
+        <View style={styles.smartRouteTitleCol}>
+          <Text style={styles.smartRouteTitle}>🧭 Smart Route</Text>
+          <Text numberOfLines={2} style={styles.smartRouteStatus}>
+            {status}
+          </Text>
+        </View>
+
+        {ready ? (
+          <TouchableOpacity
+            activeOpacity={0.8}
+            onPress={onOpen}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          >
+            <Text style={styles.smartRouteLink}>Full route ›</Text>
+          </TouchableOpacity>
+        ) : phase === 'geocoding' ? (
+          <ActivityIndicator color={RED} />
+        ) : null}
+      </View>
+
+      {ready ? (
+        <>
+          <View style={styles.smartRouteMap}>
+            <RouteMap start={start} stops={stops} path={route.path} />
+          </View>
+
+          <TouchableOpacity
+            activeOpacity={0.85}
+            style={styles.smartRouteButton}
+            onPress={() => startRouteNavigation(stops)}
+          >
+            <Text style={styles.smartRouteButtonText}>➤ Start Navigation</Text>
+          </TouchableOpacity>
+        </>
+      ) : null}
+    </View>
+  );
+};
+
+const TodayOrderCard = ({ order, stop, onPress }) => {
+  const status = ORDER_STATUS[order.status];
+  const scale = useRef(new Animated.Value(1)).current;
+
+  const pressIn = () =>
+    Animated.timing(scale, {
+      toValue: 0.98,
+      duration: 90,
+      useNativeDriver: true,
+    }).start();
+
+  const pressOut = () =>
+    Animated.spring(scale, {
+      toValue: 1,
+      friction: 5,
+      tension: 90,
+      useNativeDriver: true,
+    }).start();
+
+  return (
+    <Animated.View
+      style={[
+        styles.todayOrderCard,
+        { borderColor: status.bg, transform: [{ scale }] },
+      ]}
+    >
+      <TouchableOpacity
+        activeOpacity={1}
+        onPress={onPress}
+        onPressIn={pressIn}
+        onPressOut={pressOut}
+      >
+        {/* HEADER: order id, time, status */}
+        <View style={[styles.orderCardHeader, { backgroundColor: status.bg }]}>
+          <View style={styles.orderCardHeaderLeft}>
+            <View
+              style={[styles.orderCardIcon, { backgroundColor: status.color }]}
+            >
+              <Text style={styles.orderCardIconText}>
+                {stop ? stop.number : status.icon}
+              </Text>
+            </View>
+
+            <View>
+              <Text style={styles.orderCardId}>{order.id}</Text>
+              <Text style={styles.orderCardTime}>🕒 {order.time}</Text>
+            </View>
+          </View>
+
+          <View style={[styles.statusPill, { backgroundColor: status.color }]}>
+            <Text style={styles.statusPillText}>{status.label}</Text>
+          </View>
+        </View>
+
+        <View style={styles.orderCardBody}>
+          {/* CUSTOMER */}
+          <View style={styles.customerRow}>
+            <View style={[styles.avatar, { borderColor: status.color }]}>
+              <Text style={[styles.avatarText, { color: status.color }]}>
+                {getInitials(order.customer)}
+              </Text>
+            </View>
+
+            <View style={styles.customerInfo}>
+              <Text style={styles.customerLabel}>CUSTOMER</Text>
+              <Text numberOfLines={1} style={styles.customerName}>
+                {order.customer}
+              </Text>
+            </View>
+          </View>
+
+          {/* ROUTE: pickup -> drop */}
+          <View style={styles.routeBox}>
+            <View style={styles.routeStop}>
+              <View style={styles.routeMarkerCol}>
+                <View style={[styles.routeDot, styles.routeDotPickup]} />
+                <View style={styles.routeLine} />
+              </View>
+
+              <View style={styles.routeTextCol}>
+                <Text style={styles.routeLabel}>PICKUP</Text>
+                <Text numberOfLines={1} style={styles.routeValue}>
+                  {PICKUP_LOCATION}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.routeStop}>
+              <View style={styles.routeMarkerCol}>
+                <View style={[styles.routeDot, styles.routeDotDrop]} />
+              </View>
+
+              <View style={styles.routeTextCol}>
+                <Text style={styles.routeLabel}>DROP</Text>
+                <Text numberOfLines={1} style={styles.routeValue}>
+                  {order.address}
+                </Text>
+              </View>
+            </View>
+          </View>
+
+          {/* FOOTER */}
+          <View style={styles.orderCardFooter}>
+            <View style={styles.footerChips}>
+              <View style={styles.footerChip}>
+                <Text style={styles.footerChipText}>
+                  🛍 {itemCount(order)}{' '}
+                  {itemCount(order) === 1 ? 'item' : 'items'}
+                </Text>
+              </View>
+
+              <View style={styles.footerChip}>
+                <Text style={styles.footerChipText}>
+                  {stop
+                    ? `➤ Stop ${stop.number} · ${formatKm(stop.legKm)}`
+                    : `➤ ${order.distance}`}
+                </Text>
+              </View>
+            </View>
+
+            <View
+              style={[styles.detailsButton, { backgroundColor: status.color }]}
+            >
+              <Text style={styles.detailsButtonText}>Details ›</Text>
+            </View>
+          </View>
+        </View>
+      </TouchableOpacity>
+    </Animated.View>
+  );
+};
+
+const MetricCard = ({ icon, iconBg, value, label, green }) => (
   <View style={styles.metricCard}>
     <View
       style={[
@@ -825,47 +857,23 @@ const MetricCard = ({
       </Text>
     </View>
 
-    <Text
-      style={[
-        styles.metricValue,
-        green && styles.metricValueGreen,
-      ]}
-    >
+    <Text style={[styles.metricValue, green && styles.metricValueGreen]}>
       {value}
     </Text>
 
-    <Text style={styles.metricLabel}>
-      {label}
-    </Text>
+    <Text style={styles.metricLabel}>{label}</Text>
   </View>
 );
 
-const BottomNav = ({
-  icon,
-  label,
-  active,
-  onPress,
-}) => (
+const BottomNav = ({ icon, label, active, onPress }) => (
   <TouchableOpacity
     activeOpacity={0.75}
     style={styles.navItem}
     onPress={onPress}
   >
-    <Text
-      style={[
-        styles.navIcon,
-        active && styles.navIconActive,
-      ]}
-    >
-      {icon}
-    </Text>
+    <Text style={[styles.navIcon, active && styles.navIconActive]}>{icon}</Text>
 
-    <Text
-      style={[
-        styles.navLabel,
-        active && styles.navLabelActive,
-      ]}
-    >
+    <Text style={[styles.navLabel, active && styles.navLabelActive]}>
       {label}
     </Text>
   </TouchableOpacity>
@@ -893,99 +901,6 @@ const styles = StyleSheet.create({
   // ======================================================
   // HEADER
   // ======================================================
-
-  header: {
-    height: rs(73),
-
-    backgroundColor: '#FFFFFF',
-
-    borderBottomWidth: 1,
-    borderBottomColor: '#E6E9EF',
-
-    paddingHorizontal: rs(20),
-
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-
-  brandArea: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-
-  brandLogo: {
-    width: rs(40),
-    height: rs(40),
-
-    marginRight: rs(10),
-  },
-
-  brandTitle: {
-    color: DARK,
-
-    fontSize: fs(19),
-    fontWeight: '900',
-  },
-
-  brandSubtitle: {
-    color: MUTED,
-
-    fontSize: fs(13),
-    marginTop: rs(2),
-  },
-
-  headerRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-
-  dutyBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-
-    backgroundColor: '#E9FFF4',
-
-    paddingHorizontal: rs(14),
-    paddingVertical: rs(11),
-
-    borderRadius: rs(28),
-
-    borderWidth: 1,
-    borderColor: '#A9EBCB',
-
-    marginRight: rs(10),
-  },
-
-  dutyDot: {
-    width: rs(10),
-    height: rs(10),
-
-    borderRadius: rs(5),
-
-    backgroundColor: GREEN,
-
-    marginRight: rs(6),
-  },
-
-  dutyText: {
-    color: '#183D32',
-
-    fontSize: fs(12),
-    fontWeight: '900',
-
-    letterSpacing: 1.2,
-  },
-
-  profileImage: {
-    width: rs(42),
-    height: rs(42),
-
-    borderRadius: rs(21),
-
-    borderWidth: 1.5,
-    borderColor: '#E1C5BA',
-  },
 
   // ======================================================
   // COMMON
@@ -1183,6 +1098,665 @@ const styles = StyleSheet.create({
 
     fontSize: fs(11),
     fontWeight: '600',
+  },
+
+  // ======================================================
+  // HERO (TODAY'S TOTAL)
+  // ======================================================
+
+  heroCard: {
+    backgroundColor: RED,
+
+    borderRadius: rs(20),
+
+    padding: rs(20),
+
+    overflow: 'hidden',
+
+    shadowColor: RED,
+    shadowOpacity: 0.3,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+
+    elevation: 8,
+  },
+
+  heroCircleLarge: {
+    position: 'absolute',
+    top: -rs(60),
+    right: -rs(40),
+
+    width: rs(180),
+    height: rs(180),
+
+    borderRadius: rs(90),
+
+    backgroundColor: 'rgba(255,255,255,0.10)',
+  },
+
+  heroCircleSmall: {
+    position: 'absolute',
+    bottom: -rs(50),
+    left: -rs(30),
+
+    width: rs(120),
+    height: rs(120),
+
+    borderRadius: rs(60),
+
+    backgroundColor: 'rgba(255,255,255,0.07)',
+  },
+
+  heroTopRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+  },
+
+  heroLabel: {
+    color: 'rgba(255,255,255,0.85)',
+
+    fontSize: fs(12),
+    fontWeight: '800',
+
+    letterSpacing: 1,
+  },
+
+  heroValue: {
+    color: '#FFFFFF',
+
+    fontSize: fs(46),
+    fontWeight: '900',
+
+    marginTop: rs(2),
+  },
+
+  heroDateChip: {
+    backgroundColor: 'rgba(255,255,255,0.18)',
+
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.3)',
+
+    borderRadius: rs(20),
+
+    paddingHorizontal: rs(12),
+    paddingVertical: rs(6),
+  },
+
+  heroDateText: {
+    color: '#FFFFFF',
+
+    fontSize: fs(12),
+    fontWeight: '800',
+  },
+
+  heroProgressTrack: {
+    marginTop: rs(12),
+
+    height: rs(8),
+
+    borderRadius: rs(4),
+
+    backgroundColor: 'rgba(255,255,255,0.25)',
+
+    overflow: 'hidden',
+  },
+
+  heroProgressFill: {
+    height: '100%',
+
+    borderRadius: rs(4),
+
+    backgroundColor: '#FFFFFF',
+  },
+
+  heroBottomRow: {
+    marginTop: rs(9),
+
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+
+  heroProgressText: {
+    color: 'rgba(255,255,255,0.92)',
+
+    fontSize: fs(13),
+    fontWeight: '700',
+  },
+
+  heroPercentText: {
+    color: '#FFFFFF',
+
+    fontSize: fs(14),
+    fontWeight: '900',
+  },
+
+  // ======================================================
+  // STATUS BREAKDOWN
+  // ======================================================
+
+  statusGrid: {
+    marginTop: rs(14),
+
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+
+  statusCard: {
+    width: '31.5%',
+
+    backgroundColor: '#FFFFFF',
+
+    borderRadius: rs(14),
+
+    paddingTop: rs(16),
+    paddingBottom: rs(14),
+    paddingHorizontal: rs(12),
+
+    overflow: 'hidden',
+
+    shadowColor: '#000000',
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+
+    elevation: 3,
+  },
+
+  statusAccent: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+
+    height: rs(4),
+  },
+
+  statusIcon: {
+    width: rs(36),
+    height: rs(36),
+
+    borderRadius: rs(18),
+
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  statusIconText: {
+    fontSize: fs(16),
+    fontWeight: '900',
+  },
+
+  statusValue: {
+    color: DARK,
+
+    fontSize: fs(26),
+    fontWeight: '900',
+
+    marginTop: rs(10),
+  },
+
+  statusLabel: {
+    color: MUTED,
+
+    fontSize: fs(11),
+    fontWeight: '700',
+    lineHeight: fs(14),
+
+    marginTop: rs(2),
+  },
+
+  // ======================================================
+  // TODAY'S ORDERS
+  // ======================================================
+
+  sectionTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+
+  countChip: {
+    marginLeft: rs(8),
+
+    minWidth: rs(24),
+
+    paddingHorizontal: rs(7),
+    paddingVertical: rs(2),
+
+    borderRadius: rs(12),
+
+    backgroundColor: '#FFE8E8',
+
+    alignItems: 'center',
+  },
+
+  countChipText: {
+    color: RED,
+
+    fontSize: fs(12),
+    fontWeight: '900',
+  },
+
+  routeOrderHint: {
+    color: MUTED,
+
+    fontSize: fs(12),
+    fontWeight: '700',
+  },
+
+  smartRouteCard: {
+    marginTop: rs(24),
+
+    padding: rs(16),
+
+    borderRadius: rs(20),
+
+    backgroundColor: '#FFFFFF',
+
+    borderWidth: 1,
+    borderColor: BORDER,
+
+    shadowColor: '#000000',
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+
+    elevation: 2,
+  },
+
+  smartRouteTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+
+  smartRouteTitleCol: {
+    flex: 1,
+    marginRight: rs(10),
+  },
+
+  smartRouteTitle: {
+    color: DARK,
+
+    fontSize: fs(17),
+    fontWeight: '900',
+  },
+
+  smartRouteStatus: {
+    marginTop: rs(3),
+
+    color: MUTED,
+
+    fontSize: fs(12),
+    fontWeight: '700',
+  },
+
+  smartRouteLink: {
+    color: RED,
+
+    fontSize: fs(13),
+    fontWeight: '900',
+  },
+
+  smartRouteMap: {
+    height: rs(190),
+
+    marginTop: rs(12),
+
+    borderRadius: rs(14),
+    overflow: 'hidden',
+
+    backgroundColor: '#E8EDF3',
+  },
+
+  smartRouteButton: {
+    marginTop: rs(12),
+
+    height: rs(48),
+
+    borderRadius: rs(14),
+
+    backgroundColor: RED,
+
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  smartRouteButtonText: {
+    color: '#FFFFFF',
+
+    fontSize: fs(15),
+    fontWeight: '900',
+  },
+
+  countChipGreen: {
+    backgroundColor: ORDER_STATUS.delivered.bg,
+  },
+
+  countChipTextGreen: {
+    color: ORDER_STATUS.delivered.color,
+  },
+
+  ordersList: {
+    marginTop: rs(12),
+  },
+
+  ordersLoader: {
+    marginVertical: rs(28),
+  },
+
+  ordersEmpty: {
+    alignItems: 'center',
+    paddingVertical: rs(28),
+    paddingHorizontal: rs(20),
+    backgroundColor: '#FFFFFF',
+    borderRadius: rs(18),
+    borderWidth: 1.5,
+    borderColor: BORDER,
+  },
+
+  ordersEmptyIcon: {
+    fontSize: fs(30),
+  },
+
+  ordersEmptyTitle: {
+    marginTop: rs(8),
+    color: DARK,
+    fontSize: fs(16),
+    fontWeight: '900',
+  },
+
+  ordersEmptyText: {
+    marginTop: rs(4),
+    color: MUTED,
+    fontSize: fs(13),
+    textAlign: 'center',
+  },
+
+  ordersRetryButton: {
+    marginTop: rs(14),
+    paddingHorizontal: rs(22),
+    paddingVertical: rs(10),
+    borderRadius: rs(12),
+    backgroundColor: RED,
+  },
+
+  ordersRetryText: {
+    color: '#FFFFFF',
+    fontSize: fs(14),
+    fontWeight: '800',
+  },
+
+  todayOrderCard: {
+    backgroundColor: '#FFFFFF',
+
+    borderRadius: rs(18),
+
+    borderWidth: 1.5,
+
+    marginBottom: rs(14),
+
+    overflow: 'hidden',
+
+    shadowColor: '#000000',
+    shadowOpacity: 0.07,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 5 },
+
+    elevation: 4,
+  },
+
+  orderCardHeader: {
+    paddingHorizontal: rs(14),
+    paddingVertical: rs(12),
+
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+
+  orderCardHeaderLeft: {
+    flex: 1,
+
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+
+  orderCardIcon: {
+    width: rs(36),
+    height: rs(36),
+
+    borderRadius: rs(11),
+
+    alignItems: 'center',
+    justifyContent: 'center',
+
+    marginRight: rs(10),
+  },
+
+  orderCardIconText: {
+    color: '#FFFFFF',
+
+    fontSize: fs(16),
+    fontWeight: '900',
+  },
+
+  orderCardId: {
+    color: DARK,
+
+    fontSize: fs(16),
+    fontWeight: '900',
+
+    letterSpacing: 0.3,
+  },
+
+  orderCardTime: {
+    color: '#44546A',
+
+    fontSize: fs(11),
+    fontWeight: '700',
+
+    marginTop: rs(2),
+  },
+
+  statusPill: {
+    paddingHorizontal: rs(11),
+    paddingVertical: rs(6),
+
+    borderRadius: rs(20),
+
+    marginLeft: rs(8),
+  },
+
+  statusPillText: {
+    color: '#FFFFFF',
+
+    fontSize: fs(11),
+    fontWeight: '900',
+
+    letterSpacing: 0.3,
+  },
+
+  orderCardBody: {
+    padding: rs(14),
+  },
+
+  customerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+
+  avatar: {
+    width: rs(46),
+    height: rs(46),
+
+    borderRadius: rs(23),
+
+    borderWidth: 2,
+
+    backgroundColor: '#FFFFFF',
+
+    alignItems: 'center',
+    justifyContent: 'center',
+
+    marginRight: rs(12),
+  },
+
+  avatarText: {
+    fontSize: fs(15),
+    fontWeight: '900',
+  },
+
+  customerInfo: {
+    flex: 1,
+  },
+
+  customerLabel: {
+    color: MUTED,
+
+    fontSize: fs(10),
+    fontWeight: '800',
+
+    letterSpacing: 1,
+  },
+
+  customerName: {
+    color: DARK,
+
+    fontSize: fs(17),
+    fontWeight: '900',
+
+    marginTop: rs(2),
+  },
+
+  routeBox: {
+    marginTop: rs(14),
+
+    backgroundColor: '#F7F9FC',
+
+    borderRadius: rs(12),
+
+    paddingHorizontal: rs(12),
+    paddingVertical: rs(10),
+  },
+
+  routeStop: {
+    flexDirection: 'row',
+  },
+
+  routeMarkerCol: {
+    width: rs(16),
+
+    alignItems: 'center',
+
+    marginRight: rs(10),
+  },
+
+  routeDot: {
+    width: rs(12),
+    height: rs(12),
+
+    borderRadius: rs(6),
+
+    marginTop: rs(4),
+  },
+
+  routeDotPickup: {
+    backgroundColor: '#FFFFFF',
+
+    borderWidth: 3,
+    borderColor: RED,
+  },
+
+  routeDotDrop: {
+    backgroundColor: GREEN,
+  },
+
+  routeLine: {
+    flex: 1,
+
+    width: 0,
+
+    borderLeftWidth: 2,
+    borderLeftColor: '#C9D2DE',
+    borderStyle: 'dashed',
+
+    marginVertical: rs(3),
+  },
+
+  routeTextCol: {
+    flex: 1,
+
+    paddingBottom: rs(8),
+  },
+
+  routeLabel: {
+    color: MUTED,
+
+    fontSize: fs(10),
+    fontWeight: '800',
+
+    letterSpacing: 1,
+  },
+
+  routeValue: {
+    color: '#1F2A3D',
+
+    fontSize: fs(13),
+    fontWeight: '700',
+
+    marginTop: rs(2),
+  },
+
+  orderCardFooter: {
+    marginTop: rs(12),
+
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+
+  footerChips: {
+    flex: 1,
+
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+  },
+
+  footerChip: {
+    backgroundColor: '#F1F4F9',
+
+    borderWidth: 1,
+    borderColor: '#E1E6EF',
+
+    borderRadius: rs(20),
+
+    paddingHorizontal: rs(10),
+    paddingVertical: rs(6),
+
+    marginRight: rs(6),
+  },
+
+  footerChipText: {
+    color: '#33435E',
+
+    fontSize: fs(12),
+    fontWeight: '700',
+  },
+
+  detailsButton: {
+    paddingHorizontal: rs(16),
+    paddingVertical: rs(9),
+
+    borderRadius: rs(12),
+  },
+
+  detailsButtonText: {
+    color: '#FFFFFF',
+
+    fontSize: fs(13),
+    fontWeight: '900',
   },
 
   // ======================================================
@@ -1645,7 +2219,7 @@ const styles = StyleSheet.create({
   // ======================================================
 
   sectionHeadingRow: {
-    marginTop: rs(20),
+    marginTop: rs(24),
 
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1655,10 +2229,8 @@ const styles = StyleSheet.create({
   sectionHeading: {
     color: DARK,
 
-    fontSize: fs(14),
+    fontSize: fs(18),
     fontWeight: '900',
-
-    letterSpacing: 0.7,
   },
 
   liveText: {
@@ -2021,7 +2593,12 @@ const styles = StyleSheet.create({
 
   mapImage: {
     width: '100%',
-    height: rs(165),
+    height: rs(240),
+  },
+
+  mapWebView: {
+    flex: 1,
+    backgroundColor: 'transparent',
   },
 
   // ======================================================
